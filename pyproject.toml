@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roman_pointing"
+version = "0.1.0"
+description = "Commissioning pipeline for Roman Space Telescope pointing calibration"
+authors = [{name = "S. T. Sohn"}]
+dependencies = [
+    "numpy",
+    "scipy",
+    "astropy",
+    "photutils",
+    "pysiaf",
+    "roman_datamodels",
+    "matplotlib",
+    "astroquery",
+    "tqdm",
+    "stpsf"
+]
+
+[tool.setuptools.packages.find]
+include = ["roman_pointing*"]
