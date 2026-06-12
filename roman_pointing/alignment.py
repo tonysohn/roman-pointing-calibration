@@ -1,11 +1,15 @@
+import csv
+import os
+import warnings
+from datetime import datetime
+
+import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import pysiaf
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
-# Relative imports from your own package
 from .diagnostics import generate_alignment_diagnostics
 
 
@@ -121,33 +125,7 @@ def _attitude_residuals(
 ):
     """
     Objective function for the global Levenberg-Marquardt attitude optimizer.
-
-    Evaluates the difference between observed V2/V3 focal plane coordinates and the
-    sky catalog coordinates mapped through a perturbed attitude matrix.
-
-    Parameters
-    ----------
-    delta_params : list or ndarray
-        The parameters being optimized: [d_RA, d_Dec, d_PA] in arcseconds.
-    base_ra : float
-        Nominal telescope Right Ascension (degrees).
-    base_dec : float
-        Nominal telescope Declination (degrees).
-    base_pa : float
-        Nominal telescope Position Angle (degrees).
-    ra_cat : array_like
-        Catalog Right Ascension values for the matched stars (degrees).
-    dec_cat : array_like
-        Catalog Declination values for the matched stars (degrees).
-    v2_obs : array_like
-        Observed V2 positions of the matched stars (arcsec).
-    v3_obs : array_like
-        Observed V3 positions of the matched stars (arcsec).
-
-    Returns
-    -------
-    residuals : ndarray
-        A flattened 1D array of the combined V2 and V3 positional residuals.
+    ...
     """
 
     # NOTE: delta_params must be treated as physical sky arcseconds
@@ -163,7 +141,15 @@ def _attitude_residuals(
         att_matrix, np.asarray(ra_cat), np.asarray(dec_cat)
     )
 
-    return np.concatenate([v2_calc - v2_obs, v3_calc - v3_obs])
+    # --- THE SPHERICAL FIX ---
+    # 1. Convert reference V3 (arcsec) to radians
+    v3_rad = np.deg2rad(v3_calc / 3600.0)
+
+    # 2. Apply the spherical cosine correction to the V2 difference
+    dv2 = (v2_calc - v2_obs) * np.cos(v3_rad)
+    dv3 = v3_calc - v3_obs
+
+    return np.concatenate([dv2, dv3])
 
 
 def _fit_sca_alignment(

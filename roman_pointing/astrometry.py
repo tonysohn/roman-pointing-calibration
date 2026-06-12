@@ -35,8 +35,6 @@ def fetch_local_commissioning_gaia(
             dec=ref_catalog["dec"] * u.deg,
             pm_ra_cosdec=ref_catalog["pmra"] * u.mas / u.yr,
             pm_dec=ref_catalog["pmdec"] * u.mas / u.yr,
-            parallax=np.zeros(len(ref_catalog)) * u.mas,  # Stripping parallax noise
-            radial_velocity=np.zeros(len(ref_catalog)) * u.km / u.s,
             frame="icrs",
             obstime=Time(2016.0, format="jyear"),
         )
