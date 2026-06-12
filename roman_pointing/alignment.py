@@ -335,6 +335,7 @@ def align_wfi(
 
         for aper_name, catalog in phot_catalogs.items():
             aper = roman_siaf[aper_name]
+
             if not aper:
                 continue
 
@@ -361,10 +362,14 @@ def align_wfi(
 
             if np.sum(valid) > 5:
                 valid_scas_found += 1
-                global_v2_obs.extend(v2_obs[valid])
-                global_v3_obs.extend(v3_obs[valid])
-                global_ra_ref.extend(ref_catalog["ra_epoch"][idx[valid]])
-                global_dec_ref.extend(ref_catalog["dec_epoch"][idx[valid]])
+
+                # --- SPEED HACK: Sub-sample to 50 stars max per SCA ---
+                valid_indices = np.where(valid)[0][:50]
+
+                global_v2_obs.extend(v2_obs[valid_indices])
+                global_v3_obs.extend(v3_obs[valid_indices])
+                global_ra_ref.extend(ref_catalog["ra_epoch"][idx[valid_indices]])
+                global_dec_ref.extend(ref_catalog["dec_epoch"][idx[valid_indices]])
 
         print(f"  -> Iteration {i + 1}: Matched {valid_scas_found}/18 SCAs.")
 
@@ -385,6 +390,8 @@ def align_wfi(
             loss="linear" if i == 0 else "soft_l1",
             f_scale=1.0,
             bounds=bounds,
+            ftol=1e-5,
+            xtol=1e-5,
         )
 
         d_ra, d_dec, d_pa = global_result.x

@@ -118,7 +118,9 @@ def extract_wfi_sources(
     except AttributeError:
         sca_name = "UNKNOWN"
 
-    data_es = file.data * 2
+    exptime = file.meta.exposure.exposure_time
+    gain = 2.2  # May have to update based on metadata value in the future
+    data_es = file.data * exptime * gain
 
     bkgrms = MADStdBackgroundRMS()
     mmm_bkg = MMMBackground()

@@ -17,7 +17,6 @@ import numpy as np
 import pysiaf
 import roman_datamodels as rdm
 from astropy.table import Table
-from scipy.spatial.transform import Rotation as R
 
 # Import the core modules from the pipeline
 from roman_pointing import (
@@ -27,6 +26,7 @@ from roman_pointing import (
     export_alignment_to_yaml,
     fetch_local_commissioning_gaia,
 )
+from scipy.spatial.transform import Rotation as R
 
 
 def main():
@@ -34,7 +34,7 @@ def main():
     # CONFIGURATION
     # =========================================================================
     # Toggle to enable/disable Differential Velocity Aberration correction
-    apply_dva = False
+    apply_dva = True
 
     # We use (0,0,0) as the default to test the pipeline's blind recovery
     manual_offsets = {"d_ra_arcsec": 0.0, "d_dec_arcsec": 0.0, "d_pa_arcsec": 0.0}
@@ -184,7 +184,7 @@ def main():
     d_pa_arcsec = (attitude_results["PA_V3"] - pa_v3) * 3600.0
 
     print("\n========================================================")
-    print("           RECOVERED GLOBAL PERTURBATIONS (DELTAS)       ")
+    print("           MEASURED GLOBAL OFFSETS (DELTAS)       ")
     print("========================================================")
     print(f"Δ RA  (V1): {d_ra_arcsec:8.2f} arcsec")
     print(f"Δ Dec (V1): {d_dec_arcsec:8.2f} arcsec")

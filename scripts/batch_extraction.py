@@ -1,7 +1,7 @@
 import glob
 import os
 
-from roman_pointing_calibration import extract_wfi_sources
+from roman_pointing import extract_wfi_sources
 
 # 1. Initialize the dictionary required by the pipeline
 phot_catalogs = {}
