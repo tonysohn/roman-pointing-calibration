@@ -31,7 +31,10 @@ def _extract_with_gaussian(data_es, bkg_val, std_val):
     sources = bright_stars(data_es)
 
     if sources is None or len(sources) == 0:
-        return Table(names=("x", "y", "flux"), dtype=("f8", "f8", "f8"))
+        return Table(
+            names=("x", "y", "flux", "sharpness", "roundness"),
+            dtype=("f8", "f8", "f8", "f8", "f8"),
+        )
 
     # 2. Morphological cuts
     mask = (
@@ -41,9 +44,17 @@ def _extract_with_gaussian(data_es, bkg_val, std_val):
     )
     sources_masked = sources[mask]
 
+    if len(sources_masked) == 0:
+        return Table(
+            names=("x", "y", "flux", "sharpness", "roundness"),
+            dtype=("f8", "f8", "f8", "f8", "f8"),
+        )
+
     xarr_raw = sources_masked["x_centroid"]
     yarr_raw = sources_masked["y_centroid"]
     fluxarr_raw = sources_masked["flux"]
+    sharpness_raw = sources_masked["sharpness"]
+    roundness_raw = sources_masked["roundness"]
 
     # 3. Precision centroiding
     with warnings.catch_warnings():
@@ -57,15 +68,17 @@ def _extract_with_gaussian(data_es, bkg_val, std_val):
             data_es, xarr_raw, yarr_raw, box_size=5, centroid_func=centroid_2dg
         )
 
-    # Return exactly matching the pipeline standard
-    return Table([xarr_fit, yarr_fit, fluxarr_raw], names=("x", "y", "flux"))
+    # Return exactly matching the pipeline standard with new morphological columns
+    return Table(
+        [xarr_fit, yarr_fit, fluxarr_raw, sharpness_raw, roundness_raw],
+        names=("x", "y", "flux", "sharpness", "roundness"),
+    )
 
 
 def _extract_with_stpsf(data_es, bkg_val, std_val, sca_name):
     """
     Helper function to extract sources using STPSF and Photutils IterativePSFPhotometry.
     """
-
     print(f"  -> Generating STPSF optical model for {sca_name}...")
 
     # 1. Configure the Roman Simulator
@@ -91,14 +104,23 @@ def _extract_with_stpsf(data_es, bkg_val, std_val, sca_name):
     catalog = photometry(data_es - bkg_val)
 
     if catalog is None or len(catalog) == 0:
-        return Table(names=("x", "y", "flux"), dtype=("f8", "f8", "f8"))
+        return Table(
+            names=("x", "y", "flux", "sharpness", "roundness"),
+            dtype=("f8", "f8", "f8", "f8", "f8"),
+        )
 
     # Rename columns to match the pipeline standard
     catalog.rename_column("x_fit", "x")
     catalog.rename_column("y_fit", "y")
     catalog.rename_column("flux_fit", "flux")
 
-    return catalog
+    # Add NaNs for sharpness and roundness to maintain schema parity across methods
+    if "sharpness" not in catalog.colnames:
+        catalog["sharpness"] = np.nan
+        catalog["roundness"] = np.nan
+
+    # Ensure column order matches Gaussian output
+    return catalog[("x", "y", "flux", "sharpness", "roundness")]
 
 
 def extract_wfi_sources(
@@ -109,6 +131,7 @@ def extract_wfi_sources(
 ):
     """
     Extracts high-fidelity star positions from a Roman Level 2 WFI image.
+    Converts DN/s to total electrons before extraction.
     """
     print(f"Extracting sources from: {asdf_filepath}")
     file = rdm.open(asdf_filepath)
@@ -118,9 +141,18 @@ def extract_wfi_sources(
     except AttributeError:
         sca_name = "UNKNOWN"
 
-    exptime = file.meta.exposure.exposure_time
-    gain = 2.2  # May have to update based on metadata value in the future
+    # --- PHYSICAL UNIT CONVERSION ---
+    # Safely extract exposure time depending on ASDF schema version
+    try:
+        exptime = file.meta.exposure.effective_exposure_time
+    except AttributeError:
+        exptime = file.meta.exposure.exposure_time
+
+    gain = 2.2  # Electrons per ADU
+
+    # Convert image from DN/s to total collected electrons
     data_es = file.data * exptime * gain
+    # ---------------------------------
 
     bkgrms = MADStdBackgroundRMS()
     mmm_bkg = MMMBackground()
@@ -161,7 +193,10 @@ def extract_wfi_sources(
 
     if len(sources_edge) == 0:
         file.close()
-        return Table(names=("x", "y", "flux"), dtype=("f8", "f8", "f8"))
+        return Table(
+            names=("x", "y", "flux", "sharpness", "roundness"),
+            dtype=("f8", "f8", "f8", "f8", "f8"),
+        )
 
     coords = np.column_stack((sources_edge["x"], sources_edge["y"]))
     srcaper = CircularAnnulus(coords, r_in=1, r_out=3)
@@ -188,7 +223,7 @@ def extract_wfi_sources(
 
     final_catalog = sources_edge[np.where(satflag == 0)]
 
-    print(f"  -> Background std: {std:.2f}, bkg: {bkg:.2f}")
+    print(f"  -> Background std: {std:.2f} e-, bkg: {bkg:.2f} e-")
     print(f"  -> Sources pre-filtering: {len(sources)}")
     print(f"  -> Sources after edge cut: {len(sources_edge)}")
     print(f"  -> Sources after DQ screening (Final): {len(final_catalog)}")

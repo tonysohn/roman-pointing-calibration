@@ -1,6 +1,7 @@
 import glob
 import os
 
+import numpy as np
 from roman_pointing import extract_wfi_sources
 
 # 1. Initialize the dictionary required by the pipeline
@@ -36,7 +37,7 @@ for filepath in perturbed_files:
         # Run the source extraction tool with the selected strategy
         catalog = extract_wfi_sources(
             asdf_filepath=filepath,
-            centroid_method=CENTROID_STRATEGY,  # Pass the toggle here!
+            centroid_method=CENTROID_STRATEGY,
             save_diagnostic_plot=True,
             plot_outdir="./",
         )
@@ -44,14 +45,25 @@ for filepath in perturbed_files:
         # Store the resulting Astropy Table in the dictionary
         if len(catalog) > 0:
             phot_catalogs[dict_key] = catalog
-            catalog.write(
-                f"{basename}_catalog.ecsv", format="ascii.ecsv", overwrite=True
+
+            # --- FILE EXPORT FORMATTING ---
+            # Create a copy so we don't truncate the pipeline's internal 64-bit precision
+            fmt_catalog = catalog.copy()
+
+            # Truncate all floating point numbers to 4 decimal places
+            for col in fmt_catalog.colnames:
+                if fmt_catalog[col].dtype.kind in "fc":  # if float or complex
+                    fmt_catalog[col].format = "%.4f"
+
+            # Write with fixed-width formatting for perfect column alignment
+            out_filename = f"{basename}_catalog.ecsv"
+            fmt_catalog.write(
+                out_filename, format="ascii.fixed_width", delimiter=" ", overwrite=True
             )
+            print(f"  -> Exported formatted ECSV catalog: {out_filename}")
         else:
             print(f"Skipping {dict_key}: No valid sources extracted.")
     else:
         print(f"Could not parse SCA name from filename: {basename}")
 
-print(
-    f"\nExtraction complete. Successfully built phot_catalogs with {len(phot_catalogs)} SCAs."
-)
+print("\nBatch extraction complete.")
