@@ -57,9 +57,7 @@ for filepath in perturbed_files:
 
             # Write with fixed-width formatting for perfect column alignment
             out_filename = f"{basename}_catalog.ecsv"
-            fmt_catalog.write(
-                out_filename, format="ascii.fixed_width", delimiter=" ", overwrite=True
-            )
+            fmt_catalog.write(out_filename, format="ascii.ecsv", overwrite=True)
             print(f"  -> Exported formatted ECSV catalog: {out_filename}")
         else:
             print(f"Skipping {dict_key}: No valid sources extracted.")

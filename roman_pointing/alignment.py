@@ -272,12 +272,26 @@ def _fit_sca_alignment(
     dv2, dv2_err = coeffs_x[2], err_x[2]
     dv3, dv3_err = coeffs_y[2], err_y[2]
 
+    # Extract Rotation
     sin_theta = (coeffs_y[0] - coeffs_x[1]) / 2.0
     d_theta_deg = np.degrees(np.arcsin(np.clip(sin_theta, -1.0, 1.0)))
-
     theta_err_deg = np.degrees(np.sqrt(err_y[0] ** 2 + err_x[1] ** 2) / 2.0)
 
-    return dv2, dv3, d_theta_deg, dv2_err, dv3_err, theta_err_deg
+    # ------------------------------------------------------------------------------
+    # Extract Scale (Magnification) and Skew
+    # A perfect, un-distorted match would have coeffs_x[0] = 1.0 and coeffs_y[1] = 1.0
+    scale_x = coeffs_x[0]
+    scale_y = coeffs_y[1]
+    skew = (coeffs_x[1] + coeffs_y[0]) / 2.0
+
+    # Calculate final RMS of the fit (in mas)
+    final_rms_mas = (
+        np.std(np.hypot(x_ref[valid] - x_calc, y_ref[valid] - y_calc)) * 1000.0
+    )
+    # ------------------------------------------------------------------------------
+    # return dv2, dv3, d_theta_deg, dv2_err, dv3_err, theta_err_deg
+
+    return dv2, dv3, d_theta_deg, scale_x, scale_y, skew, final_rms_mas
 
 
 def align_wfi(
@@ -558,7 +572,10 @@ def align_wfi(
                 all_matched_flux.append(f_val)
                 all_matched_mag.append(m_val)
 
-        dv2, dv3, d_theta, dv2_err, dv3_err, d_theta_err = _fit_sca_alignment(
+        # ---------------------------------------------------------------------
+        # THE DYNAMIC DISTORTION EVALUATOR
+        # ---------------------------------------------------------------------
+        dv2, dv3, d_theta, scale_x, scale_y, skew, sca_rms = _fit_sca_alignment(
             v2_obs[valid],
             v3_obs[valid],
             v2_gaia_locked[idx[valid]],
@@ -567,14 +584,57 @@ def align_wfi(
             aper.V3Ref,
         )
 
+        # Retrieve the Roman polynomial coefficient arrays
+        poly_coeffs = aper.get_polynomial_coefficients()
+
+        # Initialize our dictionary entry with the standard 3-parameter updates
         calibrated_siaf_params[aper_name] = {
             "V2Ref": aper.V2Ref + dv2,
-            "V2Ref_err": dv2_err,
             "V3Ref": aper.V3Ref + dv3,
-            "V3Ref_err": dv3_err,
             "V3IdlYAngle": aper.V3IdlYAngle + d_theta,
-            "V3IdlYAngle_err": d_theta_err,
+            "Sci2IdlX_1": poly_coeffs["Sci2IdlX"][1],  # X-Scale baseline
+            "Sci2IdlX_2": poly_coeffs["Sci2IdlX"][2],  # X-Skew baseline
+            "Sci2IdlY_1": poly_coeffs["Sci2IdlY"][1],  # Y-Skew baseline
+            "Sci2IdlY_2": poly_coeffs["Sci2IdlY"][2],  # Y-Scale baseline
         }
+
+        # THE METRIC: Did the physical scale or skew diverge from the PySIAF model?
+        # A deviation of 5e-5 (50 ppm) creates a >10 mas error at the chip edge.
+        scale_error = max(abs(scale_x - 1.0), abs(scale_y - 1.0))
+        skew_error = abs(skew)
+
+        if scale_error > 5e-5 or skew_error > 5e-5:
+            print(f"\n  -> [{aper_name}] Scale/Skew anomaly detected.")
+            print(
+                f"     Scale X: {scale_x:.6f}, Scale Y: {scale_y:.6f}, Skew: {skew:.6f}"
+            )
+            print(f"     Dynamically updating linear SIAF polynomials...")
+
+            # 1. Update the specific linear indices in our extracted arrays
+            poly_coeffs["Sci2IdlX"][1] *= scale_x
+            poly_coeffs["Sci2IdlX"][2] += skew
+            poly_coeffs["Sci2IdlY"][1] += skew
+            poly_coeffs["Sci2IdlY"][2] *= scale_y
+
+            # 2. Update the dictionary for YAML export
+            calibrated_siaf_params[aper_name]["Sci2IdlX_1"] = poly_coeffs["Sci2IdlX"][1]
+            calibrated_siaf_params[aper_name]["Sci2IdlX_2"] = poly_coeffs["Sci2IdlX"][2]
+            calibrated_siaf_params[aper_name]["Sci2IdlY_1"] = poly_coeffs["Sci2IdlY"][1]
+            calibrated_siaf_params[aper_name]["Sci2IdlY_2"] = poly_coeffs["Sci2IdlY"][2]
+
+            # 3. Inject the updated arrays back into the PySIAF aperture
+            lower_poly_coeffs = {k.lower(): v for k, v in poly_coeffs.items()}
+            aper.set_polynomial_coefficients(**lower_poly_coeffs)
+
+            # 4. Re-calculate the observed coordinates with the bent math
+            x_idl = np.asarray(v2_obs) - aper.V2Ref
+            y_idl = np.asarray(v3_obs) - aper.V3Ref
+
+            v2_obs_fixed = aper.V2Ref + (x_idl * scale_x + y_idl * skew + dv2)
+            v3_obs_fixed = aper.V3Ref + (x_idl * skew + y_idl * scale_y + dv3)
+
+            v2_obs = v2_obs_fixed
+            v3_obs = v3_obs_fixed
 
     # =========================================================================
     # DIAGNOSTIC LOG EXPORTS & SUMMARY PLOT
@@ -728,6 +788,13 @@ def export_alignment_to_yaml(calibrated_siaf_params, output_prefix="roman_wfi_up
         yaml_lines.append(f"  V2Ref: {params['V2Ref']:.3f}")
         yaml_lines.append(f"  V3Ref: {params['V3Ref']:.3f}")
         yaml_lines.append(f"  V3IdlYAngle: {params['V3IdlYAngle']:.5f}")
+
+        # --- Export Linear Distortion terms (Array indices 1 and 2) ---
+        # Comment out if unwanted
+        yaml_lines.append(f"  Sci2IdlX_1: {params['Sci2IdlX_1']:.8e}")
+        yaml_lines.append(f"  Sci2IdlX_2: {params['Sci2IdlX_2']:.8e}")
+        yaml_lines.append(f"  Sci2IdlY_1: {params['Sci2IdlY_1']:.8e}")
+        yaml_lines.append(f"  Sci2IdlY_2: {params['Sci2IdlY_2']:.8e}")
 
     # Write out to the file
     with open(output_filename, "w") as f:
