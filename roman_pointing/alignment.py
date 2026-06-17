@@ -685,7 +685,7 @@ def align_wfi(
         plt.close()
 
     print(
-        f"  -> Diagnostic suite generated in ./{diag_dir}/ (Logs, DS9 .reg files, and PNG overlays)."
+        f"\n  -> Diagnostic suite generated in ./{diag_dir}/ (Logs, DS9 .reg files, and PNG overlays)."
     )
 
     # =========================================================================
@@ -702,9 +702,10 @@ def align_wfi(
         "PA_V3_err_arcsec": att_err_arcsec[2],
     }
 
-    # Calculate the mean residual shift for reporting ONLY.
-    # We DO NOT subtract this from the SCAs. If the detector plate
-    # physically shifted relative to WFI_CEN, we want the SIAF to reflect it.
+    # =========================================================================
+    # THE ZERO-MEAN CONSTRAINT (FIXED ANCHOR PRINCIPLE)
+    # =========================================================================
+    # Calculate the mean residual shift of the 18 SCAs relative to the model.
     if valid_scas:
         mean_dv2 = np.mean(
             [
@@ -718,9 +719,31 @@ def align_wfi(
                 for s in valid_scas
             ]
         )
+        mean_dtheta = np.mean(
+            [
+                calibrated_siaf_params[s]["V3IdlYAngle"] - roman_siaf[s].V3IdlYAngle
+                for s in valid_scas
+            ]
+        )
 
+        # 1. APPLY THE CONSTRAINT
+        # Subtract the mean from all local SCA updates to pin WFI_CEN.
+        for s in valid_scas:
+            calibrated_siaf_params[s]["V2Ref"] -= mean_dv2
+            calibrated_siaf_params[s]["V3Ref"] -= mean_dv3
+            calibrated_siaf_params[s]["V3IdlYAngle"] -= mean_dtheta
+
+        # 2. LOG THE ABSORBED SHIFT
         attitude_results["Residual_Mean_V2_mas"] = mean_dv2 * 1000.0
         attitude_results["Residual_Mean_V3_mas"] = mean_dv3 * 1000.0
+
+        # 3. INJECT THE SHIFT INTO THE SPACECRAFT POINTING
+        # Because we removed the shift from the detectors, the spacecraft must
+        # move to compensate. We convert the V2/V3 arcsecond shifts back into
+        # RA/Dec degrees using the local declination.
+        attitude_results["RA_V1"] += (mean_dv2 / 3600.0) / cos_dec
+        attitude_results["DEC_V1"] += mean_dv3 / 3600.0
+        attitude_results["PA_V3"] += mean_dtheta / 3600.0
 
     print("\n--- Alignment Diagnostics Summary ---")
     print(
