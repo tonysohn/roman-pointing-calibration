@@ -592,10 +592,14 @@ def align_wfi(
             "V2Ref": aper.V2Ref + dv2,
             "V3Ref": aper.V3Ref + dv3,
             "V3IdlYAngle": aper.V3IdlYAngle + d_theta,
-            "Sci2IdlX_1": poly_coeffs["Sci2IdlX"][1],  # X-Scale baseline
-            "Sci2IdlX_2": poly_coeffs["Sci2IdlX"][2],  # X-Skew baseline
-            "Sci2IdlY_1": poly_coeffs["Sci2IdlY"][1],  # Y-Skew baseline
-            "Sci2IdlY_2": poly_coeffs["Sci2IdlY"][2],  # Y-Scale baseline
+            "Sci2IdlX10": poly_coeffs["Sci2IdlX"][1],
+            "Sci2IdlX01": poly_coeffs["Sci2IdlX"][2],
+            "Sci2IdlY10": poly_coeffs["Sci2IdlY"][1],
+            "Sci2IdlY01": poly_coeffs["Sci2IdlY"][2],
+            "Idl2SciX10": poly_coeffs["Idl2SciX"][1],
+            "Idl2SciX01": poly_coeffs["Idl2SciX"][2],
+            "Idl2SciY10": poly_coeffs["Idl2SciY"][1],
+            "Idl2SciY01": poly_coeffs["Idl2SciY"][2],
         }
 
         # THE METRIC: Did the physical scale or skew diverge from the PySIAF model?
@@ -616,11 +620,33 @@ def align_wfi(
             poly_coeffs["Sci2IdlY"][1] += skew
             poly_coeffs["Sci2IdlY"][2] *= scale_y
 
+            # Build the 2x2 forward transformation matrix
+            M_forward = np.array(
+                [
+                    [poly_coeffs["Sci2IdlX"][1], poly_coeffs["Sci2IdlX"][2]],
+                    [poly_coeffs["Sci2IdlY"][1], poly_coeffs["Sci2IdlY"][2]],
+                ]
+            )
+            # Invert it to get the backward coefficients
+            M_inverse = np.linalg.inv(M_forward)
+            poly_coeffs["Idl2SciX"][1] = M_inverse[0, 0]
+            poly_coeffs["Idl2SciX"][2] = M_inverse[0, 1]
+            poly_coeffs["Idl2SciY"][1] = M_inverse[1, 0]
+            poly_coeffs["Idl2SciY"][2] = M_inverse[1, 1]
+
             # 2. Update the dictionary for YAML export
-            calibrated_siaf_params[aper_name]["Sci2IdlX_1"] = poly_coeffs["Sci2IdlX"][1]
-            calibrated_siaf_params[aper_name]["Sci2IdlX_2"] = poly_coeffs["Sci2IdlX"][2]
-            calibrated_siaf_params[aper_name]["Sci2IdlY_1"] = poly_coeffs["Sci2IdlY"][1]
-            calibrated_siaf_params[aper_name]["Sci2IdlY_2"] = poly_coeffs["Sci2IdlY"][2]
+            calibrated_siaf_params[aper_name].update(
+                {
+                    "Sci2IdlX10": poly_coeffs["Sci2IdlX"][1],
+                    "Sci2IdlX01": poly_coeffs["Sci2IdlX"][2],
+                    "Sci2IdlY10": poly_coeffs["Sci2IdlY"][1],
+                    "Sci2IdlY01": poly_coeffs["Sci2IdlY"][2],
+                    "Idl2SciX10": poly_coeffs["Idl2SciX"][1],
+                    "Idl2SciX01": poly_coeffs["Idl2SciX"][2],
+                    "Idl2SciY10": poly_coeffs["Idl2SciY"][1],
+                    "Idl2SciY01": poly_coeffs["Idl2SciY"][2],
+                }
+            )
 
             # 3. Inject the updated arrays back into the PySIAF aperture
             lower_poly_coeffs = {k.lower(): v for k, v in poly_coeffs.items()}
@@ -792,19 +818,12 @@ def export_alignment_to_yaml(calibrated_siaf_params, output_prefix="roman_wfi_up
         The full name of the generated file (e.g., 'roman_wfi_updates_20260526.yml').
     """
     current_date = datetime.now().strftime("%Y%m%d")
-
-    # Construct the dynamic filename
     output_filename = f"{output_prefix}_{current_date}.yml"
-
-    yaml_lines = []
-
-    # Keep the internal version stamp as well, it's good practice!
-    yaml_lines.append(f"version: '{current_date}'")
+    yaml_lines = [f"version: '{current_date}'"]
 
     # Sort the keys to ensure WFI01 through WFI18 are printed in order
     for sca_name in sorted(calibrated_siaf_params.keys()):
         formatted_name = sca_name if "_FULL" in sca_name else f"{sca_name}_FULL"
-
         yaml_lines.append(f"{formatted_name}:")
 
         params = calibrated_siaf_params[sca_name]
@@ -812,19 +831,22 @@ def export_alignment_to_yaml(calibrated_siaf_params, output_prefix="roman_wfi_up
         yaml_lines.append(f"  V3Ref: {params['V3Ref']:.3f}")
         yaml_lines.append(f"  V3IdlYAngle: {params['V3IdlYAngle']:.5f}")
 
-        # --- Export Linear Distortion terms (Array indices 1 and 2) ---
-        # Comment out if unwanted
-        yaml_lines.append(f"  Sci2IdlX_1: {params['Sci2IdlX_1']:.8e}")
-        yaml_lines.append(f"  Sci2IdlX_2: {params['Sci2IdlX_2']:.8e}")
-        yaml_lines.append(f"  Sci2IdlY_1: {params['Sci2IdlY_1']:.8e}")
-        yaml_lines.append(f"  Sci2IdlY_2: {params['Sci2IdlY_2']:.8e}")
+        # --- Export Linear Distortion terms (Forward and Inverse) ---
+        if "Sci2IdlX10" in params:
+            yaml_lines.append(f"  Sci2IdlX10: {params['Sci2IdlX10']:.8e}")
+            yaml_lines.append(f"  Sci2IdlX01: {params['Sci2IdlX01']:.8e}")
+            yaml_lines.append(f"  Sci2IdlY10: {params['Sci2IdlY10']:.8e}")
+            yaml_lines.append(f"  Sci2IdlY01: {params['Sci2IdlY01']:.8e}")
 
-    # Write out to the file
+            yaml_lines.append(f"  Idl2SciX10: {params['Idl2SciX10']:.8e}")
+            yaml_lines.append(f"  Idl2SciX01: {params['Idl2SciX01']:.8e}")
+            yaml_lines.append(f"  Idl2SciY10: {params['Idl2SciY10']:.8e}")
+            yaml_lines.append(f"  Idl2SciY01: {params['Idl2SciY01']:.8e}")
+
     with open(output_filename, "w") as f:
         f.write("\n".join(yaml_lines) + "\n")
 
     print(
         f"[{os.path.basename(output_filename)}] Successfully exported {len(calibrated_siaf_params)} SCA updates."
     )
-
-    return output_filename  # Return the filename in case the main script needs it
+    return output_filename
