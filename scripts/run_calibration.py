@@ -206,13 +206,12 @@ def main():
         # Execute the vectorized Boresight solver using raw telemetry
         q_b2fgs_calibrated = calibrate_roman_fgs_alignment(
             reference_stars_radec=ref_stars_radec,
-            measured_v2_v3=measured_v2_v3,
-            q_eci2b=acs_telemetry_qbj,  # Raw FSW qbj
-            v_sc_eci_kms=velocity_kms,  # Raw Velocity
+            measured_v2_v3=measured_v2_v3,  # Passed perfectly as Telescope V2/V3
+            q_eci2b=acs_telemetry_qbj,
+            v_sc_eci_kms=velocity_kms,
             wfi_cen_aper=roman_siaf["WFI_CEN"],
-            q_b2fgs_old=q_b2fgs_nominal,  # Raw FSW qb
+            q_b2fgs_old=q_b2fgs_nominal,
         )
-
         print("\n========================================================")
         print("           FGS BORESIGHT CALIBRATION RESULTS             ")
         print("========================================================")
