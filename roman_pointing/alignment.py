@@ -347,6 +347,8 @@ def align_wfi(
         if debug and i == 0:
             print(f"\n--- DEBUG LOG: Iteration {i} ---")
 
+        # Initialize a list to track which SCAs successfully survived the fit
+
         for aper_name, catalog in phot_catalogs.items():
             aper = roman_siaf[aper_name]
 
@@ -453,6 +455,9 @@ def align_wfi(
     all_matched_flux = []
     all_matched_mag = []
 
+    # Initialize a list to track which SCAs successfully survived the fit
+    successfully_fitted_scas = []
+
     # Final Local SCA Alignment Loop
     for aper_name, catalog in phot_catalogs.items():
         aper = roman_siaf[aper_name]
@@ -482,7 +487,17 @@ def align_wfi(
         )
 
         if num_matched < 5:
-            continue
+            print(
+                f"\n  -> [{aper_name}] Failed: Insufficient stars ({num_matched}). Reverting to default SIAF."
+            )
+            # We explicitly add the dead SCA to the dictionary with its default baseline geometry
+            # so it still gets exported to the YAML file!
+            calibrated_siaf_params[aper_name] = {
+                "V2Ref": aper.V2Ref,
+                "V3Ref": aper.V3Ref,
+                "V3IdlYAngle": aper.V3IdlYAngle,
+            }
+            continue  # Skip the dynamic distortion math and move to the next chip
 
         valid_indices = np.where(valid)[0]
 
@@ -612,7 +627,7 @@ def align_wfi(
             print(
                 f"     Scale X: {scale_x:.6f}, Scale Y: {scale_y:.6f}, Skew: {skew:.6f}"
             )
-            print(f"     Dynamically updating linear SIAF polynomials...")
+            print("     Dynamically updating linear SIAF polynomials...")
 
             # 1. Update the specific linear indices in our extracted arrays
             poly_coeffs["Sci2IdlX"][1] *= scale_x
@@ -661,6 +676,8 @@ def align_wfi(
 
             v2_obs = v2_obs_fixed
             v3_obs = v3_obs_fixed
+
+        successfully_fitted_scas.append(aper_name)
 
     # =========================================================================
     # DIAGNOSTIC LOG EXPORTS & SUMMARY PLOT
@@ -729,53 +746,55 @@ def align_wfi(
     }
 
     # =========================================================================
-    # THE ZERO-MEAN CONSTRAINT (FIXED ANCHOR PRINCIPLE)
+    # THE ZERO-MEAN CONSTRAINT (FAULT-TOLERANT FIXED ANCHOR PRINCIPLE)
     # =========================================================================
-    # Calculate the mean residual shift of the 18 SCAs relative to the model.
-    if valid_scas:
+    # Only calculate the global plate shift using the SCAs that actually solved
+    if len(successfully_fitted_scas) > 0:
+        # 1. Calculate the mean shift using ONLY the healthy chips
         mean_dv2 = np.mean(
             [
                 calibrated_siaf_params[s]["V2Ref"] - roman_siaf[s].V2Ref
-                for s in valid_scas
+                for s in successfully_fitted_scas
             ]
         )
         mean_dv3 = np.mean(
             [
                 calibrated_siaf_params[s]["V3Ref"] - roman_siaf[s].V3Ref
-                for s in valid_scas
+                for s in successfully_fitted_scas
             ]
         )
         mean_dtheta = np.mean(
             [
                 calibrated_siaf_params[s]["V3IdlYAngle"] - roman_siaf[s].V3IdlYAngle
-                for s in valid_scas
+                for s in successfully_fitted_scas
             ]
         )
 
-        # 1. APPLY THE CONSTRAINT
-        # Subtract the mean from all local SCA updates to pin WFI_CEN.
-        for s in valid_scas:
+        # 2. Apply the constraint ONLY to the healthy chips
+        for s in successfully_fitted_scas:
             calibrated_siaf_params[s]["V2Ref"] -= mean_dv2
             calibrated_siaf_params[s]["V3Ref"] -= mean_dv3
             calibrated_siaf_params[s]["V3IdlYAngle"] -= mean_dtheta
 
-        # 2. LOG THE ABSORBED SHIFT
+        # 3. LOG THE ABSORBED SHIFT FOR THE BAM
         attitude_results["Residual_Mean_V2_mas"] = mean_dv2 * 1000.0
         attitude_results["Residual_Mean_V3_mas"] = mean_dv3 * 1000.0
 
-        # 3. INJECT THE SHIFT INTO THE SPACECRAFT POINTING
-        # Because we removed the shift from the detectors, the spacecraft must
-        # move to compensate. We convert the V2/V3 arcsecond shifts back into
-        # RA/Dec degrees using the local declination.
+        # 4. INJECT THE SHIFT INTO THE SPACECRAFT POINTING
         attitude_results["RA_V1"] += (mean_dv2 / 3600.0) / cos_dec
         attitude_results["DEC_V1"] += mean_dv3 / 3600.0
         attitude_results["PA_V3"] += mean_dtheta / 3600.0
+
+    else:
+        print(
+            "\nCRITICAL WARNING: 0/18 SCAs solved. Boresight update will rely purely on Global Fit."
+        )
 
     print("\n--- Alignment Diagnostics Summary ---")
     print(
         f"Global Fit RMS Residual: {np.sqrt(np.mean(global_result.fun**2)):.4f} arcsec"
     )
-    print(f"Successful SCA Fits: {len(valid_scas)}/18")
+    print(f"Successful SCA Fits: {len(successfully_fitted_scas)}/18")
 
     if "Residual_Mean_V2_mas" in attitude_results:
         print(

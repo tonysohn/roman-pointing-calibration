@@ -17,6 +17,7 @@ import numpy as np
 import pysiaf
 import roman_datamodels as rdm
 from astropy.table import Table
+from scipy.spatial.transform import Rotation as R
 
 # Import the core modules from the pipeline
 from roman_pointing import (
@@ -26,7 +27,6 @@ from roman_pointing import (
     export_alignment_to_yaml,
     fetch_local_commissioning_gaia,
 )
-from scipy.spatial.transform import Rotation as R
 
 
 def main():
@@ -157,6 +157,20 @@ def main():
     except Exception as e:
         print(f"Error loading local Gaia catalog: {e}")
         return
+
+    # =========================================================================
+    # --- FAULT-TOLERANCE TEST: SIMULATE DEAD SCAs ---
+    # =========================================================================
+    scas_to_kill = ["WFI05_FULL", "WFI12_FULL", "WFI17_FULL"]
+    print("\n--- INJECTING HARDWARE FAILURES ---")
+    for bad_sca in scas_to_kill:
+        if bad_sca in phot_catalogs:
+            print(
+                f"Sabotaging {bad_sca}: Truncating to 3 stars to force alignment failure."
+            )
+            # Keep only the first 3 stars (Astropy Table slicing)
+            phot_catalogs[bad_sca] = phot_catalogs[bad_sca][:3]
+    # =========================================================================
 
     # =========================================================================
     # 2. WFI MACROSCOPIC ALIGNMENT (Local Geometry)
