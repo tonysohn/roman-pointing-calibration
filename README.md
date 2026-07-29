@@ -18,7 +18,7 @@ This repository contains the commissioning pipeline for the Nancy Grace Roman Sp
 This package is designed to be installed in "editable" mode, allowing you to run the extraction and alignment scripts from any data directory while maintaining a centralized codebase.
 
 ```bash
-git clone [https://github.com/YOUR_USERNAME/roman-pointing-calibration.git](https://github.com/YOUR_USERNAME/roman-pointing-calibration.git)
+git clone [https://github.com/tonysohn/roman-pointing-calibration.git](https://github.com/YOUR_USERNAME/roman-pointing-calibration.git)
 cd roman-pointing-calibration
 pip install -e .
 ```
