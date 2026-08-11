@@ -2,7 +2,7 @@
 """
 run_calibration.py
 
-Master Commissioning Workflow for the Roman Space Telescope pointing calibration.
+Master Commissioning Pipeline for the Roman Space Telescope pointing calibration.
 Executes two sequential tasks:
   1. WFI Macroscopic Alignment: Solves the geometric layout of the 18 SCAs.
   2. FGS Boresight Calibration: Derives the updated Body-to-FGS quaternion
@@ -19,7 +19,7 @@ import roman_datamodels as rdm
 from astropy.table import Table
 from scipy.spatial.transform import Rotation as R
 
-# Import the core modules from the workflow
+# Import the core modules from the pipeline
 from roman_pointing import (
     align_wfi,
     apply_dva_scale_to_catalog,
@@ -35,6 +35,9 @@ def main():
     # =========================================================================
     # Toggle to enable/disable Differential Velocity Aberration correction
     apply_dva = True
+
+    # We use (0,0,0) as the default to test the pipeline's blind recovery
+    manual_offsets = {"d_ra_arcsec": 0.0, "d_dec_arcsec": 0.0, "d_pa_arcsec": 0.0}
 
     # =========================================================================
     # 1. DATA INGEST & INITIALIZATION
@@ -92,7 +95,7 @@ def main():
                 "Warning: DVA metadata not found in ASDF. DVA correction will be skipped."
             )
 
-        # 3. Spacecraft Velocity Meta
+        # 3. Spacecraft Velocity Meta (Moved inside the context manager!)
         try:
             v_x = f.meta.ephemeris.velocity_x
             v_y = f.meta.ephemeris.velocity_y
@@ -156,6 +159,20 @@ def main():
         return
 
     # =========================================================================
+    # --- FAULT-TOLERANCE TEST: SIMULATE DEAD SCAs ---
+    # =========================================================================
+    scas_to_kill = ["WFI05_FULL", "WFI12_FULL", "WFI17_FULL"]
+    print("\n--- INJECTING HARDWARE FAILURES ---")
+    for bad_sca in scas_to_kill:
+        if bad_sca in phot_catalogs:
+            print(
+                f"Sabotaging {bad_sca}: Truncating to 3 stars to force alignment failure."
+            )
+            # Keep only the first 3 stars (Astropy Table slicing)
+            phot_catalogs[bad_sca] = phot_catalogs[bad_sca][:3]
+    # =========================================================================
+
+    # =========================================================================
     # 2. WFI MACROSCOPIC ALIGNMENT (Local Geometry)
     # =========================================================================
     print("\n--- 2. RUNNING WFI ALIGNMENT ---")
@@ -164,7 +181,7 @@ def main():
         phot_catalogs=phot_catalogs,
         ref_catalog=ref_catalog,
         pointing_info=pointing_info,
-        user_offsets={"d_ra_arcsec": 0.0, "d_dec_arcsec": 0.0, "d_pa_arcsec": 0.0},
+        user_offsets=manual_offsets,
         max_iterations=5,
         debug=False,  # Set to True for verbose histogram/solver output
     )
@@ -193,6 +210,7 @@ def main():
     print("\n--- 3. RUNNING FGS BORESIGHT CALIBRATION ---")
 
     # Format the WFI cross-matched stars for the Wahba FGS solver
+    # (Assuming matched_pairs_log format: [SCA, X, Y, RA, Dec, Flux, Mag, V2, V3, ResV2, ResV3])
     ref_stars_radec = np.array([[row[3], row[4]] for row in matched_pairs_log])
     measured_v2_v3 = np.array([[row[7], row[8]] for row in matched_pairs_log])
 
@@ -202,7 +220,7 @@ def main():
         # Execute the vectorized Boresight solver using raw telemetry
         q_b2fgs_calibrated = calibrate_roman_fgs_alignment(
             reference_stars_radec=ref_stars_radec,
-            measured_v2_v3=measured_v2_v3, 
+            measured_v2_v3=measured_v2_v3,  # Passed perfectly as Telescope V2/V3
             q_eci2b=acs_telemetry_qbj,
             v_sc_eci_kms=velocity_kms,
             wfi_cen_aper=roman_siaf["WFI_CEN"],
@@ -222,10 +240,12 @@ def main():
         delta_q = q_cal * q_nom.inv()
 
         # 2. Project the Boresight Vector (V1 axis: [1, 0, 0])
+        # This tells us exactly how much the boresight (V1) moved on the sky
         v1_nominal = np.array([1, 0, 0])
         v1_calibrated = delta_q.apply(v1_nominal)
 
         # Calculate the angular separation between the old and new boresight
+        # Use dot product for small angles: theta = arccos(u.v)
         cos_theta = np.clip(np.dot(v1_nominal, v1_calibrated), -1.0, 1.0)
         boresight_shift_arcsec = np.degrees(np.arccos(cos_theta)) * 3600.0
 
