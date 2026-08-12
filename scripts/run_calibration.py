@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-run_calibration.py
+run_calibration_2.py
 
-Master Commissioning Workflow for the Roman Space Telescope pointing calibration.
+Commissioning Workflow for the Roman Space Telescope pointing calibration.
 Executes two sequential tasks:
   1. WFI Macroscopic Alignment: Solves the geometric layout of the 18 SCAs.
   2. FGS Boresight Calibration: Derives the updated Body-to-FGS quaternion
@@ -31,10 +31,25 @@ from roman_pointing import (
 
 def main():
     # =========================================================================
-    # CONFIGURATION
+    # CONFIGURATION & OVERRIDES
     # =========================================================================
     # Toggle to enable/disable Differential Velocity Aberration correction
     apply_dva = True
+
+    # --- MANUAL TELEMETRY OVERRIDES ---
+    # Set to a float to override pipeline metadata, or None to read from ASDF.
+    MANUAL_RA_V1 = None
+    MANUAL_DEC_V1 = None
+    MANUAL_PA_V3 = None
+
+    MANUAL_VX_KMS = None
+    MANUAL_VY_KMS = None
+    MANUAL_VZ_KMS = None
+
+    # Set to a list/tuple of 4 floats to override qbj, or None to calculate from pointing.
+    # Example: MANUAL_QBJ = [0.70515723, 0.08269192, -0.68259625, -0.17314064]
+    MANUAL_QBJ = None
+    # ----------------------------------
 
     # =========================================================================
     # 1. DATA INGEST & INITIALIZATION
@@ -43,8 +58,13 @@ def main():
     roman_siaf = pysiaf.Siaf("Roman")
 
     # Reconstruct the phot_catalogs dictionary from the ECSV files
-    ecsv_files = sorted(glob.glob("*_perturbed_cal.asdf_catalog.ecsv"))
+    ecsv_files = sorted(glob.glob("*_wfi??_f146_cal.asdf_catalog.ecsv"))
     print(f"Found {len(ecsv_files)} extracted catalogs to align.")
+    if not ecsv_files:
+        print(
+            "Error: No *_catalog.ecsv files found. Run batch_extraction.py script first."
+        )
+        return
 
     phot_catalogs = {}
     for filepath in ecsv_files:
@@ -66,7 +86,7 @@ def main():
         return
 
     # Extract nominal pointing metadata to anchor the reference catalog query
-    original_asdfs = glob.glob("*_perturbed_cal.asdf")
+    original_asdfs = glob.glob("*_wfi??_f146_cal.asdf")
     if not original_asdfs:
         print("Error: No original ASDF files found. Cannot extract pointing metadata.")
         return
@@ -75,10 +95,18 @@ def main():
     print(f"\nExtracting reference observation metadata from: {original_asdf}")
 
     with rdm.open(original_asdf) as f:
-        # 1. Pointing Meta
-        ra_v1 = f.meta.pointing.ra_v1
-        dec_v1 = f.meta.pointing.dec_v1
-        pa_v3 = f.meta.pointing.pa_v3
+        # 1. Pointing Meta (with manual override check)
+        try:
+            ra_v1 = MANUAL_RA_V1 if MANUAL_RA_V1 is not None else f.meta.pointing.ra_v1
+            dec_v1 = (
+                MANUAL_DEC_V1 if MANUAL_DEC_V1 is not None else f.meta.pointing.dec_v1
+            )
+            pa_v3 = MANUAL_PA_V3 if MANUAL_PA_V3 is not None else f.meta.pointing.pa_v3
+        except AttributeError:
+            print(
+                "Error: Pointing metadata missing from ASDF and no manual override provided."
+            )
+            return
 
         # 2. DVA Meta
         try:
@@ -89,23 +117,40 @@ def main():
         except AttributeError:
             has_dva_meta = False
             print(
-                "Warning: DVA metadata not found in ASDF. DVA correction will be skipped."
+                "Warning: DVA metadata not found in ASDF. DVA correction will NOT be applied."
             )
 
-        # 3. Spacecraft Velocity Meta
+        # 3. Spacecraft Velocity Meta (with manual override check)
         try:
-            v_x = f.meta.ephemeris.velocity_x
-            v_y = f.meta.ephemeris.velocity_y
-            v_z = f.meta.ephemeris.velocity_z
+            v_x = (
+                MANUAL_VX_KMS
+                if MANUAL_VX_KMS is not None
+                else f.meta.ephemeris.velocity_x
+            )
+            v_y = (
+                MANUAL_VY_KMS
+                if MANUAL_VY_KMS is not None
+                else f.meta.ephemeris.velocity_y
+            )
+            v_z = (
+                MANUAL_VZ_KMS
+                if MANUAL_VZ_KMS is not None
+                else f.meta.ephemeris.velocity_z
+            )
             velocity_kms = np.array([v_x, v_y, v_z])
         except AttributeError:
-            print("Warning: Velocity missing from ASDF meta. Using hardcoded fallback.")
-            velocity_kms = np.array([-4.33382, 26.99558, 11.70196])
+            print(
+                "Error: Spacecraft velocity missing from ASDF meta and no manual override provided."
+            )
+            return
 
         # 4. Observation Date
         try:
             obs_date_str = f.meta.observation.date_start
         except AttributeError:
+            print(
+                "Warning: Observation date missing from ASDF. Defaulting to 2026-09-20T00:00:00"
+            )
             obs_date_str = "2026-09-20T00:00:00"
 
     pointing_info = {"RA_V1": ra_v1, "DEC_V1": dec_v1, "PA_V3": pa_v3}
@@ -116,8 +161,16 @@ def main():
     # ---------------------------------------------------------
     # FLIGHT TELEMETRY INGESTION
     # ---------------------------------------------------------
-    # Telemetry Quaternion (SCF_AC_SDR_QBJ -> Body to ECI)
-    acs_telemetry_qbj = np.array([0.70515723, 0.08269192, -0.68259625, -0.17314064])
+    if MANUAL_QBJ is not None:
+        acs_telemetry_qbj = np.array(MANUAL_QBJ)
+        print("  -> Using MANUAL OVERRIDE for Telemetry Quaternion (SCF_AC_SDR_QBJ).")
+    else:
+        # Dynamically calculate qbj from the pointing information
+        m_eci2b = pysiaf.utils.rotations.attitude_matrix(0, 0, ra_v1, dec_v1, pa_v3)
+        acs_telemetry_qbj = R.from_matrix(m_eci2b.T).as_quat()
+        print(
+            "  -> Derived Telemetry Quaternion (SCF_AC_SDR_QBJ) directly from pointing metadata."
+        )
 
     # Nominal BAM Telemetry (SCF_AC_FGS_TBL_Qb -> FGS to Body)
     q_b2fgs_nominal = np.array(
@@ -166,7 +219,7 @@ def main():
         pointing_info=pointing_info,
         user_offsets={"d_ra_arcsec": 0.0, "d_dec_arcsec": 0.0, "d_pa_arcsec": 0.0},
         max_iterations=5,
-        debug=False,  # Set to True for verbose histogram/solver output
+        debug=False,
     )
 
     # Export to SIAF YAML
@@ -199,10 +252,10 @@ def main():
     print(f"Feeding {len(ref_stars_radec)} cross-matched stars into Wahba's Problem...")
 
     try:
-        # Execute the vectorized Boresight solver using raw telemetry
+        # Execute the vectorized Boresight solver using the dynamic or manual telemetry
         q_b2fgs_calibrated = calibrate_roman_fgs_alignment(
             reference_stars_radec=ref_stars_radec,
-            measured_v2_v3=measured_v2_v3, 
+            measured_v2_v3=measured_v2_v3,
             q_eci2b=acs_telemetry_qbj,
             v_sc_eci_kms=velocity_kms,
             wfi_cen_aper=roman_siaf["WFI_CEN"],
