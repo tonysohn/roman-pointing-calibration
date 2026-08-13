@@ -30,7 +30,6 @@ The pipeline is split into two primary runner scripts located in the `scripts/` 
 1. Batch Source Extraction
 
 Navigate to your directory containing the Level 2 ASDF files and execute the extraction script. This will generate `.ecsv` catalogs for each SCA.
-(Note: You can toggle between 'gaussian' and 'epsf' methods directly inside the script).
 
 ```bash
 cd /path/to/commissioning/data/
