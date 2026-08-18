@@ -167,7 +167,9 @@ def main():
     else:
         # Dynamically calculate qbj from the pointing information
         m_eci2b = pysiaf.utils.rotations.attitude_matrix(0, 0, ra_v1, dec_v1, pa_v3)
-        acs_telemetry_qbj = R.from_matrix(m_eci2b.T).as_quat()
+        acs_telemetry_qbj = R.from_matrix(
+            m_eci2b.T
+        ).as_quat()  ### CHECK whether the transpose is needed here
         print(
             "  -> Derived Telemetry Quaternion (SCF_AC_SDR_QBJ) directly from pointing metadata."
         )

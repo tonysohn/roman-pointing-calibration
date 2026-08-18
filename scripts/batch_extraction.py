@@ -2,6 +2,7 @@ import glob
 import os
 
 import numpy as np
+
 from roman_pointing import extract_wfi_sources
 
 # 1. Initialize the dictionary required by the pipeline
