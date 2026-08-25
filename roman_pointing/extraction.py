@@ -1,3 +1,4 @@
+import json
 import os
 import warnings
 
@@ -15,17 +16,39 @@ from photutils.detection import DAOStarFinder, IRAFStarFinder
 from photutils.psf import GriddedPSFModel, IterativePSFPhotometry
 
 
+def load_phot_config(config_path="car086_phot_config.json"):
+    """Loads tuning parameters, falling back to nominal defaults if missing."""
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            print(f"Loading custom photometry parameters from {config_path}")
+            return json.load(f)
+    else:
+        print("Config not found. Using pre-flight nominal parameters.")
+        return {
+            "sigma_threshold": 50.0,
+            "fwhm": 1.5,
+            "sharp_lo": 0.6,
+            "sharp_hi": 1.4,
+            "round_hi": 0.6,
+            "min_flux": 50.0,
+        }
+
+
 def _extract_with_gaussian(data_es, bkg_val, std_val):
     """
     Helper function to extract sources using IRAFStarFinder and 2D Gaussian centroiding.
+    Uses dynamic parameters loaded from JSON configuration.
     """
-    # 1. Initial coarse pass
+    # 1. Load configuration (uses defaults if JSON is missing)
+    cfg = load_phot_config()
+
+    # 2. Initial coarse pass with dynamic parameters
     bright_stars = IRAFStarFinder(
-        threshold=50.0 * std_val + bkg_val,
-        fwhm=1.5,
-        min_separation=7,
-        roundness_range=(0.0, 0.6),
-        sharpness_range=(0.6, 1.4),
+        threshold=cfg["sigma_threshold"] * std_val + bkg_val,
+        fwhm=cfg["fwhm"],
+        min_separation=7.0 * cfg["fwhm"],
+        roundness_range=(-cfg["round_hi"], cfg["round_hi"]),
+        sharpness_range=(cfg["sharp_lo"], cfg["sharp_hi"]),
     )
 
     sources = bright_stars(data_es)
@@ -36,12 +59,8 @@ def _extract_with_gaussian(data_es, bkg_val, std_val):
             dtype=("f8", "f8", "f8", "f8", "f8"),
         )
 
-    # 2. Morphological cuts
-    mask = (
-        (sources["sharpness"] > 0.75)
-        & (sources["sharpness"] < 1.2)
-        & (sources["flux"] > 50)
-    )
+    # 3. Morphological cuts (Flux cut)
+    mask = sources["flux"] > cfg["min_flux"]
     sources_masked = sources[mask]
 
     if len(sources_masked) == 0:
@@ -50,13 +69,14 @@ def _extract_with_gaussian(data_es, bkg_val, std_val):
             dtype=("f8", "f8", "f8", "f8", "f8"),
         )
 
+    # Note: Photutils 3.0 uses x_centroid and y_centroid
     xarr_raw = sources_masked["x_centroid"]
     yarr_raw = sources_masked["y_centroid"]
     fluxarr_raw = sources_masked["flux"]
     sharpness_raw = sources_masked["sharpness"]
     roundness_raw = sources_masked["roundness"]
 
-    # 3. Precision centroiding
+    # 4. Precision centroiding
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
