@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-run_calibration_2.py
+run_calibration.py
 
 Commissioning Workflow for the Roman Space Telescope pointing calibration.
 Executes two sequential tasks:
-  1. WFI Macroscopic Alignment: Solves the geometric layout of the 18 SCAs.
+  1. WFI Macroscopic Alignment: Solves the "geometric layout" of the 18 SCAs.
   2. FGS Boresight Calibration: Derives the updated Body-to-FGS quaternion
-     using Wahba's problem and the WFI cross-matched star catalogs.
+                                using Wahba's problem and the WFI cross-matched
+                                star catalogs.
 """
 
 import glob
@@ -33,7 +34,8 @@ def main():
     # =========================================================================
     # CONFIGURATION & OVERRIDES
     # =========================================================================
-    # Toggle to enable/disable Differential Velocity Aberration correction
+    # Toggle to enable/disable Differential Velocity Aberration (DVA) correction
+    # Only turn it off if spacecraft velocities are missing or corrupted.
     apply_dva = True
 
     # --- MANUAL TELEMETRY OVERRIDES ---
