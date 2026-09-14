@@ -1,7 +1,8 @@
 import numpy as np
+import pysiaf
 from astropy.constants import c
 from scipy.spatial.transform import Rotation as R
-import pysiaf
+
 
 def calibrate_roman_fgs_alignment(
     reference_stars_radec,  # (N, 2) array [deg]
