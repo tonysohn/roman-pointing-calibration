@@ -20,9 +20,10 @@ def fetch_local_commissioning_gaia(
     ref_catalog = Table.read(local_csv_path, format="ascii.ecsv")
 
     # Clean out NaNs in proper motion (required for propagation)
-    valid_pm = ~np.isnan(ref_catalog["pmra"]) & ~np.isnan(ref_catalog["pmdec"])
-    ref_catalog = ref_catalog[valid_pm]
+    # valid_pm = ~np.isnan(ref_catalog["pmra"]) & ~np.isnan(ref_catalog["pmdec"])
+    # ref_catalog = ref_catalog[valid_pm]
 
+    apply_pm = True
     if apply_pm:
         print(
             f"  -> Propagating Gaia proper motions to {obs_date_str} (Parallax forced to 0.0)"

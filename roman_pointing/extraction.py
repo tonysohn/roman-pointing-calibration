@@ -27,10 +27,10 @@ def load_phot_config(config_path="car086_phot_config.json"):
         return {
             "sigma_threshold": 50.0,
             "fwhm": 1.5,
-            "sharp_lo": 0.6,
-            "sharp_hi": 1.4,
-            "round_hi": 0.6,
-            "min_flux": 50.0,
+            "sharp_lo": 0.85,
+            "sharp_hi": 1.25,
+            "round_hi": 0.45,
+            "min_flux": 100.0,
         }
 
 
@@ -46,8 +46,8 @@ def _extract_with_gaussian(data_es, bkg_val, std_val):
     bright_stars = IRAFStarFinder(
         threshold=cfg["sigma_threshold"] * std_val + bkg_val,
         fwhm=cfg["fwhm"],
-        min_separation=7.0 * cfg["fwhm"],
-        roundness_range=(-cfg["round_hi"], cfg["round_hi"]),
+        min_separation=7.0,
+        roundness_range=(0.0, cfg["round_hi"]),
         sharpness_range=(cfg["sharp_lo"], cfg["sharp_hi"]),
     )
 
@@ -55,7 +55,7 @@ def _extract_with_gaussian(data_es, bkg_val, std_val):
 
     if sources is None or len(sources) == 0:
         return Table(
-            names=("x", "y", "flux", "sharpness", "roundness"),
+            names=("x_centroid", "y_centroid", "flux", "sharpness", "roundness"),
             dtype=("f8", "f8", "f8", "f8", "f8"),
         )
 
@@ -65,7 +65,7 @@ def _extract_with_gaussian(data_es, bkg_val, std_val):
 
     if len(sources_masked) == 0:
         return Table(
-            names=("x", "y", "flux", "sharpness", "roundness"),
+            names=("x_centroid", "y_centroid", "flux", "sharpness", "roundness"),
             dtype=("f8", "f8", "f8", "f8", "f8"),
         )
 
@@ -171,7 +171,8 @@ def extract_wfi_sources(
     gain = 2.2  # Electrons per ADU
 
     # Convert image from DN/s to total collected electrons
-    data_es = file.data * exptime * gain
+    data_raw = file.data
+    data_es = file.data * gain  # *exptime
     # ---------------------------------
 
     bkgrms = MADStdBackgroundRMS()
@@ -222,31 +223,32 @@ def extract_wfi_sources(
     srcaper = CircularAnnulus(coords, r_in=1, r_out=3)
     srcaper_masks = srcaper.to_mask(method="center")
 
-    satflag = np.zeros((len(sources_edge),), dtype=int)
-    i = 0
+    #    satflag = np.zeros((len(sources_edge),), dtype=int)
+    #    i = 0
 
-    for mask_obj in srcaper_masks:
-        srcaper_dq = mask_obj.multiply(file.dq)
+    #    for mask_obj in srcaper_masks:
+    #        srcaper_dq = mask_obj.multiply(file.dq)
 
-        if srcaper_dq is None:
-            satflag[i] = 1
-            i += 1
-            continue
+    #        if srcaper_dq is None:
+    #            satflag[i] = 1
+    #            i += 1
+    #            continue
 
-        srcaper_dq_1d = srcaper_dq[mask_obj.data > 0]
-        badpix = np.logical_and(srcaper_dq_1d > 2, srcaper_dq_1d < 7)
-        reallybad = np.where(srcaper_dq_1d == 1)
+    #        srcaper_dq_1d = srcaper_dq[mask_obj.data > 0]
+    #        badpix = np.logical_and(srcaper_dq_1d > 2, srcaper_dq_1d < 7)
+    #        reallybad = np.where(srcaper_dq_1d == 1)
 
-        if (len(srcaper_dq_1d[badpix]) > 1) or (len(srcaper_dq_1d[reallybad]) > 0):
-            satflag[i] = 1
-        i += 1
+    #        if (len(srcaper_dq_1d[badpix]) > 1) or (len(srcaper_dq_1d[reallybad]) > 0):
+    #            satflag[i] = 1
+    #        i += 1
 
-    final_catalog = sources_edge[np.where(satflag == 0)]
+    #    final_catalog = sources_edge[np.where(satflag == 0)]
+    final_catalog = sources_edge
 
     print(f"  -> Background std: {std:.2f} e-, bkg: {bkg:.2f} e-")
     print(f"  -> Sources pre-filtering: {len(sources)}")
     print(f"  -> Sources after edge cut: {len(sources_edge)}")
-    print(f"  -> Sources after DQ screening (Final): {len(final_catalog)}")
+    #    print(f"  -> Sources after DQ screening (Final): {len(final_catalog)}")
 
     # ---------------------------------------------------------
     # DIAGNOSTIC PLOTTING
@@ -255,7 +257,7 @@ def extract_wfi_sources(
         print("  -> Generating diagnostic plot...")
         os.makedirs(plot_outdir, exist_ok=True)
 
-        norm = simple_norm(data_es, "asinh", vmin=0.5, vmax=4)
+        norm = simple_norm(data_raw, "asinh", vmin=0.1, vmax=20)
         positions = np.column_stack((final_catalog["x"], final_catalog["y"]))
 
         apertures = CircularAperture(positions, r=10) if len(positions) > 0 else None
@@ -267,7 +269,7 @@ def extract_wfi_sources(
         ax.imshow(data_es, norm=norm, cmap="Greys", origin="lower")
 
         if apertures is not None:
-            apertures.plot(color="blue", lw=0.7, alpha=0.5)
+            apertures.plot(color="blue", lw=1.2, alpha=0.5)
 
         base_name = os.path.splitext(os.path.basename(asdf_filepath))[0]
         plot_path = os.path.join(plot_outdir, f"{base_name}_sources.png")

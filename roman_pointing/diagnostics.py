@@ -1,16 +1,21 @@
-import os
 import csv
+import os
 from datetime import datetime
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
 import pysiaf
+from matplotlib.gridspec import GridSpec
+
 
 def generate_alignment_diagnostics(
-    matched_pairs_log, iteration_history, output_dir="./diagnostics"
+    matched_pairs_log,
+    iteration_history,
+    output_dir="./diagnostics",
+    calibrated_siaf_params=None,
+    nominal_siaf=None,
 ):
-
     os.makedirs(output_dir, exist_ok=True)
 
     # =========================================================================
@@ -38,13 +43,11 @@ def generate_alignment_diagnostics(
         plt.close()
 
     # =========================================================================
-    # PLOT 2 & 3: Quiver Plot and Per-SCA Statistics Table
+    # DATA PREP: Calculate Table Statistics
     # =========================================================================
     if not matched_pairs_log:
         return
 
-    # Convert the matched pairs list into a DataFrame
-    # Expected format: [SCA, X, Y, RA, Dec, Flux, Mag, V2, V3, ResV2_mas, ResV3_mas]
     columns = [
         "SCA",
         "X",
@@ -60,32 +63,40 @@ def generate_alignment_diagnostics(
     ]
     df = pd.DataFrame(matched_pairs_log, columns=columns)
 
+    # Safely load a nominal SIAF for comparison
+    if nominal_siaf is None:
+        nominal_siaf = pysiaf.Siaf("Roman")
+
     sca_stats = []
 
-    # Calculate per-SCA statistics, including local rotation
     for sca, group in df.groupby("SCA"):
+        sca_label = sca.replace("_FULL", "")
         mean_dv2 = group["ResV2_mas"].mean()
         mean_dv3 = group["ResV3_mas"].mean()
         rms = np.sqrt(np.mean(group["ResV2_mas"] ** 2 + group["ResV3_mas"] ** 2))
 
-        # Estimate SCA rotation (dTheta) around its own center
-        # Convert residuals back to arcsec for the math
         v2_local = group["V2"] - group["V2"].mean()
         v3_local = group["V3"] - group["V3"].mean()
         res_v2_arcsec = group["ResV2_mas"] / 1000.0
         res_v3_arcsec = group["ResV3_mas"] / 1000.0
 
-        # Small angle rotation approximation: dTheta = Sum(r x dV) / Sum(r^2)
         numerator = np.sum(v2_local * res_v3_arcsec - v3_local * res_v2_arcsec)
         denominator = np.sum(v2_local**2 + v3_local**2)
+        dtheta_arcsec = (numerator / denominator if denominator != 0 else 0) * 206265.0
 
-        dtheta_rad = numerator / denominator if denominator != 0 else 0
-        dtheta_arcsec = dtheta_rad * 206265.0  # Convert radians to arcsec
+        # Calculate physical shift from nominal SIAF
+        if calibrated_siaf_params and sca in calibrated_siaf_params and nominal_siaf:
+            dx_siaf = calibrated_siaf_params[sca]["V2Ref"] - nominal_siaf[sca].V2Ref
+            dy_siaf = calibrated_siaf_params[sca]["V3Ref"] - nominal_siaf[sca].V3Ref
+        else:
+            dx_siaf, dy_siaf = 0.0, 0.0
 
         sca_stats.append(
             [
-                sca,
+                sca_label,
                 len(group),
+                f"{dx_siaf:.1f}",
+                f"{dy_siaf:.1f}",
                 f"{mean_dv2:.1f}",
                 f"{mean_dv3:.1f}",
                 f"{dtheta_arcsec:.3f}",
@@ -93,96 +104,125 @@ def generate_alignment_diagnostics(
             ]
         )
 
-    # --- Setup the Figure Canvas ---
-    fig = plt.figure(figsize=(16, 10))
-    gs = GridSpec(1, 2, width_ratios=[1.5, 1], wspace=0.05)
+    # =========================================================================
+    # PLOT 2 & 3: Figure Layout Setup
+    # =========================================================================
+    fig, (ax_quiver, ax_table) = plt.subplots(1, 2, figsize=(18, 9))
+    ax_table.axis("off")  # Hide axes for the table subplot
 
-    # --- LEFT: Quiver Plot ---
-    ax_quiver = fig.add_subplot(gs[0])
+    # =========================================================================
+    # PLOT 2: Quiver Plot Construction
+    # =========================================================================
+    # Scatter all stars lightly in the background
+    ax_quiver.scatter(
+        df["V2"], df["V3"], s=0.3, color="gray", alpha=0.3, edgecolors="none"
+    )
 
-    # NEW: Plot the original stars as a faint background to show SCA boundaries
-    ax_quiver.scatter(df["V2"], df["V3"], s=1, color="gray", alpha=0.15, zorder=0)
-
-    binned_v2, binned_v3 = [], []
-    binned_dv2, binned_dv3 = [], []
-
+    # Add large, semi-transparent SCA numbers over each chip
     for sca, group in df.groupby("SCA"):
-        vec_mag = np.sqrt(group["ResV2_mas"] ** 2 + group["ResV3_mas"] ** 2)
-        p95 = np.nanpercentile(vec_mag, 95)
-        clean_group = group[vec_mag <= p95].copy()
+        mean_v2 = group["V2"].mean()
+        mean_v3 = group["V3"].mean()
+        sca_num = sca.replace("WFI", "").replace("_FULL", "")
 
-        if clean_group.empty:
-            continue
-
-        v2_bins = np.linspace(clean_group["V2"].min(), clean_group["V2"].max(), 3)
-        v3_bins = np.linspace(clean_group["V3"].min(), clean_group["V3"].max(), 3)
-
-        clean_group.loc[:, "V2_bin"] = pd.cut(
-            clean_group["V2"], bins=v2_bins, include_lowest=True
-        )
-        clean_group.loc[:, "V3_bin"] = pd.cut(
-            clean_group["V3"], bins=v3_bins, include_lowest=True
-        )
-
-        binned = (
-            clean_group.groupby(["V2_bin", "V3_bin"], observed=False)
-            .mean(numeric_only=True)
-            .dropna()
+        ax_quiver.text(
+            mean_v2,
+            mean_v3,
+            sca_num,
+            color="black",
+            fontsize=24,
+            fontweight="bold",
+            ha="center",
+            va="center",
+            alpha=0.2,
+            zorder=5,
         )
 
-        binned_v2.extend(binned["V2"].values)
-        binned_v3.extend(binned["V3"].values)
-        binned_dv2.extend(binned["ResV2_mas"].values)
-        binned_dv3.extend(binned["ResV3_mas"].values)
+    # Subsample quiver arrows so Matplotlib doesn't crash drawing 120,000 vectors
+    step = max(1, len(df) // 5000)
 
-    # NEW: Thinner arrows and smaller heads
+    # --- DYNAMIC SCALING LOGIC ---
+    # Calculate the 90th percentile of the residual magnitudes
+    res_mag = np.hypot(df["ResV2_mas"], df["ResV3_mas"])
+    p90 = np.percentile(res_mag, 90)
+
+    # Determine a clean, human-readable reference arrow value based on the data
+    if p90 < 10:
+        ref_val = 5
+    elif p90 < 40:
+        ref_val = 20
+    elif p90 < 100:
+        ref_val = 50
+    elif p90 < 300:
+        ref_val = 200
+    else:
+        ref_val = 500
+
+    # Dynamically adjust the Matplotlib scale (higher scale = smaller arrows)
+    # This ratio ensures the reference arrow always draws at the exact same visual length on the PNG
+    dynamic_scale = ref_val * 125
+
+    # Plot residual vectors normally using the dynamic scale
     q = ax_quiver.quiver(
-        binned_v2,
-        binned_v3,
-        binned_dv2,
-        binned_dv3,
-        color="crimson",
-        alpha=0.9,
-        angles="xy",
-        scale_units="xy",
-        width=0.003,
-        headwidth=3,
-        headlength=4,
-        zorder=5,
+        df["V2"].iloc[::step],
+        df["V3"].iloc[::step],
+        df["ResV2_mas"].iloc[::step],
+        df["ResV3_mas"].iloc[::step],
+        color="red",
+        scale=dynamic_scale,
+        width=0.002,
     )
 
-    ref_length_mas = np.round(np.median([float(row[-1]) for row in sca_stats]), -1)
-    if ref_length_mas <= 0:
-        ref_length_mas = 10.0
-
-    # NEW: Legend text moved below the arrow, anchor shifted left
-    ax_quiver.quiverkey(
-        q,
-        X=0.85,
-        Y=0.95,
-        U=ref_length_mas,
-        label=f"{ref_length_mas} mas residual",
-        labelpos="S",
-        fontproperties={"size": 11},
+    # Draw a clean, explicitly scaled reference arrow and label
+    ax_quiver.annotate(
+        "",
+        xy=(0.82, 0.92),
+        xytext=(0.72, 0.92),
+        xycoords="axes fraction",
+        textcoords="axes fraction",
+        arrowprops=dict(arrowstyle="-|>", color="red", lw=1.5),
+    )
+    ax_quiver.text(
+        0.77,
+        0.94,
+        f"{ref_val} mas residual",
+        color="black",
+        ha="center",
+        transform=ax_quiver.transAxes,
+        fontsize=11,
     )
 
+    # Formatting the Quiver plot axes
+    ax_quiver.invert_xaxis()  # V2 is inverted (runs right-to-left)
     ax_quiver.set_xlabel("V2 (arcsec)", fontsize=12)
     ax_quiver.set_ylabel("V3 (arcsec)", fontsize=12)
-    ax_quiver.set_title(
-        "Binned Focal Plane Residual Vectors (4x4 per SCA)", fontsize=14, pad=15
-    )
-    ax_quiver.invert_xaxis()
+    ax_quiver.set_title("Focal Plane Residual Vectors", fontsize=14)
+    ax_quiver.grid(True, linestyle="--", alpha=0.5)
 
-    ax_quiver.set_aspect("equal", adjustable="box")
-    ax_quiver.grid(True, linestyle="--", alpha=0.4)
+    # Add WFI_CEN marker
+    if calibrated_siaf_params and "WFI_CEN" in calibrated_siaf_params:
+        cen_v2 = calibrated_siaf_params["WFI_CEN"]["V2Ref"]
+        cen_v3 = calibrated_siaf_params["WFI_CEN"]["V3Ref"]
+        ax_quiver.scatter(
+            cen_v2,
+            cen_v3,
+            marker="X",
+            color="dodgerblue",
+            s=200,
+            edgecolor="white",
+            linewidth=1.5,
+            zorder=10,
+            label="WFI_CEN",
+        )
+        ax_quiver.legend(loc="lower left", fontsize=11)
 
-    # --- RIGHT: Per-SCA Table ---
-    ax_table = fig.add_subplot(gs[1])
-    ax_table.axis("off")
-
+    # =========================================================================
+    # PLOT 3: Table Construction
+    # =========================================================================
     table_headers = [
         "SCA",
         "Stars",
+        "ΔV2_SIAF\n(arcsec)",
+        "ΔV3_SIAF\n(arcsec)",
         "ΔV2\n(mas)",
         "ΔV3\n(mas)",
         "Δθ\n(arcsec)",
@@ -190,33 +230,33 @@ def generate_alignment_diagnostics(
     ]
     table_data = [table_headers] + sca_stats
 
-    # NEW: First column width increased for padding, bbox forced to full height [0,0,1,1]
     table = ax_table.table(
         cellText=table_data,
         loc="center",
         cellLoc="center",
-        colWidths=[0.22, 0.12, 0.15, 0.15, 0.15, 0.15],
+        colWidths=[0.11, 0.09, 0.16, 0.16, 0.12, 0.12, 0.13, 0.11],
         bbox=[0.0, 0.0, 1.0, 1.0],
     )
 
     table.auto_set_font_size(False)
-    table.set_fontsize(11)
+    table.set_fontsize(10)
 
-    # Style the table headers and bold the SCA names
+    # Style headers and alternating rows
     for j in range(len(table_headers)):
         table[(0, j)].set_text_props(weight="bold")
         table[(0, j)].set_facecolor("#e0e0e0")
 
     for i in range(1, len(table_data)):
-        # NEW: Bold the first column (SCA names)
         table[(i, 0)].set_text_props(weight="bold")
-
         color = "#f9f9f9" if i % 2 == 0 else "white"
         for j in range(len(table_headers)):
             table[(i, j)].set_facecolor(color)
 
-    ax_table.set_title("Per-SCA Geometric Bias Summary", fontsize=14, pad=15)
+    ax_table.set_title("Per-SCA Geometric Bias Summary", fontsize=15, pad=20)
 
+    # =========================================================================
+    # SAVE & CLOSE
+    # =========================================================================
     plt.savefig(
         os.path.join(output_dir, "focal_plane_quiver_summary.png"),
         dpi=300,

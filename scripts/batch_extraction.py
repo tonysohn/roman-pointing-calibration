@@ -16,14 +16,16 @@ CENTROID_STRATEGY = "gaussian"
 # =========================================================================
 
 # 2. Locate all perturbed files in the directory
-perturbed_files = glob.glob("*_perturbed_cal.asdf")
-perturbed_files.sort()
+input_files = glob.glob(
+    "/Users/tsohn/Roman/Commissioning/CAR-086/r0102801001001003001_0002_wfi??_f146_cal.asdf"
+)
+input_files.sort()
 
-print(f"Found {len(perturbed_files)} perturbed files to process.\n")
+print(f"Found {len(input_files)} perturbed files to process.\n")
 print(f"Using extraction strategy: '{CENTROID_STRATEGY}'\n")
 
 # 3. Loop through and extract sources
-for filepath in perturbed_files:
+for filepath in input_files:
     basename = os.path.basename(filepath)
 
     # Extract the SCA name from the filename for the output ECSV naming

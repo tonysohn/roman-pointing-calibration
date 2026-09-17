@@ -1,16 +1,123 @@
 import csv
+import glob
+import json
 import os
 import warnings
 from datetime import datetime
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pysiaf
+from astropy.table import Table
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
+from skimage.transform import SimilarityTransform
 from tqdm import tqdm
 
 from .diagnostics import generate_alignment_diagnostics
+
+
+def fit_full_distortion(x_pix, y_pix, x_idl, y_idl, x_sci_ref, y_sci_ref, degree=4):
+    """Fits an N-th order 2D polynomial from Science Pixels to Ideal Arcsec."""
+    dx = x_pix - x_sci_ref
+    dy = y_pix - y_sci_ref
+
+    terms = []
+    for d in range(degree + 1):
+        for y_deg in range(d + 1):
+            x_deg = d - y_deg
+            terms.append((dx**x_deg) * (dy**y_deg))
+
+    design_matrix = np.column_stack(terms)
+
+    # Iterative Sigma Clipping
+    valid = np.ones(len(x_pix), dtype=bool)
+    for _ in range(5):
+        X_valid = design_matrix[valid]
+        cx, _, _, _ = np.linalg.lstsq(X_valid, x_idl[valid], rcond=None)
+        cy, _, _, _ = np.linalg.lstsq(X_valid, y_idl[valid], rcond=None)
+
+        calc_x = design_matrix @ cx
+        calc_y = design_matrix @ cy
+        dist = np.hypot(x_idl - calc_x, y_idl - calc_y)
+
+        med_dist = np.median(dist[valid])
+        mad_dist = np.median(np.abs(dist[valid] - med_dist))
+        keep = dist < (med_dist + 4.0 * max(mad_dist, 1e-4))
+
+        if np.all(keep[valid]) or np.sum(keep) < len(cx):
+            break
+        valid = keep
+
+    # Final Fit
+    cx, _, _, _ = np.linalg.lstsq(design_matrix[valid], x_idl[valid], rcond=None)
+    cy, _, _, _ = np.linalg.lstsq(design_matrix[valid], y_idl[valid], rcond=None)
+
+    return cx, cy, valid
+
+
+def fit_inverse_distortion(
+    x_idl, y_idl, x_pix, y_pix, x_sci_ref, y_sci_ref, valid_mask, degree=4
+):
+    """Fits the inverse mapping from Ideal Arcsec back to Science Pixels."""
+    dx = x_pix - x_sci_ref
+    dy = y_pix - y_sci_ref
+
+    terms = []
+    for d in range(degree + 1):
+        for y_deg in range(d + 1):
+            x_deg = d - y_deg
+            terms.append((x_idl**x_deg) * (y_idl**y_deg))
+
+    design_matrix = np.column_stack(terms)
+    X_valid = design_matrix[valid_mask]
+
+    cx, _, _, _ = np.linalg.lstsq(X_valid, dx[valid_mask], rcond=None)
+    cy, _, _, _ = np.linalg.lstsq(X_valid, dy[valid_mask], rcond=None)
+
+    return cx, cy
+
+
+def load_standalone_matches_as_seed(output_dir="roman_gaia_match"):
+    out_path = Path(output_dir)
+    summary_files = list(out_path.glob("*_summary.json"))
+    if not summary_files:
+        return None
+    precomputed_seeds = {}
+    for sf in summary_files:
+        with open(sf, "r") as f:
+            data = json.load(f)
+            det = data.get("detector")
+            sca_key = f"{det}_FULL" if not det.endswith("_FULL") else det
+            precomputed_seeds[sca_key] = {
+                "dx": data.get("dx_center", 0.0),
+                "dy": data.get("dy_center", 0.0),
+                "affine_coeffs": data.get("affine_offset_coefficients"),
+            }
+    return precomputed_seeds
+
+
+def load_standalone_matches(output_dir="roman_gaia_match"):
+    matched_data = {}
+    ecsv_files = glob.glob(f"{output_dir}/*_matches.ecsv")
+    if not ecsv_files:
+        return None
+
+    for f in ecsv_files:
+        det = os.path.basename(f).split("_")[0]
+        sca_key = f"{det}_FULL" if not det.endswith("_FULL") else det
+        t = Table.read(f, format="ascii.ecsv")
+        matched_data[sca_key] = {
+            "x_obs": np.array(t["x"]),
+            "y_obs": np.array(t["y"]),
+            "ra_cat": np.array(t["ra_epoch"]),
+            "dec_cat": np.array(t["dec_epoch"]),
+            "mag_cat": np.array(t["phot_g_mean_mag"])
+            if "phot_g_mean_mag" in t.colnames
+            else np.full(len(t), 99.0),
+        }
+    return matched_data
 
 
 def _robust_cross_match(
@@ -22,9 +129,8 @@ def _robust_cross_match(
     mag_cat=None,
     broad_tol=10.0,
     strict_tol=1.0,
-    bin_size=0.5,
+    is_wfi01=False,
 ):
-
     if len(v2_obs) == 0 or len(v2_cat) == 0:
         return (
             np.zeros_like(v2_obs, dtype=bool),
@@ -42,8 +148,7 @@ def _robust_cross_match(
         & (v3_cat >= min_v3)
         & (v3_cat <= max_v3)
     )
-    v2_c_filt = v2_cat[in_bounds]
-    v3_c_filt = v3_cat[in_bounds]
+    v2_c_filt, v3_c_filt = v2_cat[in_bounds], v3_cat[in_bounds]
     orig_indices = np.where(in_bounds)[0]
 
     if len(v2_c_filt) == 0:
@@ -54,65 +159,100 @@ def _robust_cross_match(
             0.0,
         )
 
-    top_n_obs = min(40, len(v2_obs))
-    top_n_cat = min(400, len(v2_c_filt))
-
     v2_obs_arr, v3_obs_arr = np.asarray(v2_obs), np.asarray(v3_obs)
+    mag_c_filt = (
+        np.asarray(mag_cat)[in_bounds]
+        if mag_cat is not None
+        else np.ones(len(v2_c_filt)) * 99.0
+    )
+    mag_c_filt = np.where(np.isnan(mag_c_filt) | (mag_c_filt == 0.0), 99.0, mag_c_filt)
 
-    if flux_obs is not None and mag_cat is not None:
-        mag_c_filt = np.asarray(mag_cat)[in_bounds]
+    top_n_obs, top_n_cat = min(30, len(v2_obs)), min(150, len(v2_c_filt))
 
-        # FIX: Force missing/0.0 magnitudes to 99.0 so they sink to the bottom of the rank
-        mag_c_filt = np.where(
-            np.isnan(mag_c_filt) | (mag_c_filt == 0.0), 99.0, mag_c_filt
-        )
-
+    if flux_obs is not None:
         obs_sort = np.argsort(np.asarray(flux_obs))[::-1]
         v2_o_sub, v3_o_sub = (
             v2_obs_arr[obs_sort][:top_n_obs],
             v3_obs_arr[obs_sort][:top_n_obs],
         )
-        cat_sort = np.argsort(mag_c_filt)
-        v2_r_sub, v3_r_sub = (
-            v2_c_filt[cat_sort][:top_n_cat],
-            v3_c_filt[cat_sort][:top_n_cat],
-        )
     else:
         v2_o_sub, v3_o_sub = v2_obs_arr[:top_n_obs], v3_obs_arr[:top_n_obs]
-        v2_r_sub, v3_r_sub = v2_c_filt[:top_n_cat], v3_c_filt[:top_n_cat]
 
-    dv2_matrix = v2_r_sub[np.newaxis, :] - v2_o_sub[:, np.newaxis]
-    dv3_matrix = v3_r_sub[np.newaxis, :] - v3_o_sub[:, np.newaxis]
+    cat_sort = np.argsort(mag_c_filt)
+    v2_r_sub, v3_r_sub = (
+        v2_c_filt[cat_sort][:top_n_cat],
+        v3_c_filt[cat_sort][:top_n_cat],
+    )
 
-    valid_diffs = (np.abs(dv2_matrix) <= broad_tol) & (np.abs(dv3_matrix) <= broad_tol)
-    dv2_flat, dv3_flat = dv2_matrix[valid_diffs], dv3_matrix[valid_diffs]
+    effective_sub_tol = max(broad_tol, 15.0) if broad_tol >= 5.0 else broad_tol
+
+    tree_sub = cKDTree(np.column_stack([v2_r_sub, v3_r_sub]))
+    sub_dists, sub_idxs = tree_sub.query(
+        np.column_stack([v2_o_sub, v3_o_sub]), distance_upper_bound=effective_sub_tol
+    )
+    sub_valid = sub_dists < effective_sub_tol
 
     dv2_bulk, dv3_bulk = 0.0, 0.0
-    if len(dv2_flat) > 0:
-        bins = np.arange(-broad_tol, broad_tol + bin_size, bin_size)
-        H, xedges, yedges = np.histogram2d(dv2_flat, dv3_flat, bins=(bins, bins))
-
-        if np.max(H) >= 5:
-            ix, iy = np.unravel_index(np.argmax(H), H.shape)
-            if 0 < ix < H.shape[0] - 1 and 0 < iy < H.shape[1] - 1:
-                patch = H[ix - 1 : ix + 2, iy - 1 : iy + 2]
-                x_grid, y_grid = np.meshgrid([-1, 0, 1], [-1, 0, 1], indexing="ij")
-                mass = np.sum(patch)
-                dx_cent = np.sum(patch * x_grid) / mass if mass > 0 else 0
-                dy_cent = np.sum(patch * y_grid) / mass if mass > 0 else 0
-            else:
-                dx_cent, dy_cent = 0.0, 0.0
-            dv2_bulk = xedges[ix] + (bin_size / 2.0) + (dx_cent * bin_size)
-            dv3_bulk = yedges[iy] + (bin_size / 2.0) + (dy_cent * bin_size)
+    if np.sum(sub_valid) >= 3:
+        matched_obs = np.column_stack([v2_o_sub, v3_o_sub])[sub_valid]
+        matched_ref = np.column_stack([v2_r_sub, v3_r_sub])[sub_idxs[sub_valid]]
+        dv2_bulk = np.median(matched_ref[:, 0] - matched_obs[:, 0])
+        dv3_bulk = np.median(matched_ref[:, 1] - matched_obs[:, 1])
 
     ref_coords = np.column_stack([v2_c_filt, v3_c_filt])
     tree = cKDTree(ref_coords)
     obs_coords_shifted = np.column_stack([v2_obs_arr + dv2_bulk, v3_obs_arr + dv3_bulk])
-
     dist_strict, idx_strict_filt = tree.query(
         obs_coords_shifted, distance_upper_bound=strict_tol
     )
     valid_strict = dist_strict < strict_tol
+
+    if np.sum(valid_strict) > 5:
+        res_mag = np.hypot(
+            ref_coords[idx_strict_filt[valid_strict], 0]
+            - obs_coords_shifted[valid_strict, 0],
+            ref_coords[idx_strict_filt[valid_strict], 1]
+            - obs_coords_shifted[valid_strict, 1],
+        )
+        med_res = np.median(res_mag)
+        mad_res = np.median(np.abs(res_mag - med_res))
+        clip_threshold = med_res + 5.0 * max(mad_res, 0.05)
+        final_mask = res_mag < clip_threshold
+        valid_indices = np.where(valid_strict)[0]
+        valid_strict[valid_indices[~final_mask]] = False
+
+    if np.sum(valid_strict) >= 10:
+        src_pts = ref_coords[idx_strict_filt[valid_strict]]
+        dst_pts = np.column_stack([v2_obs_arr[valid_strict], v3_obs_arr[valid_strict]])
+
+        model = SimilarityTransform()
+        success = model.estimate(src_pts, dst_pts)
+
+        if success:
+            predicted_obs_coords = model(ref_coords)
+            deep_tree = cKDTree(predicted_obs_coords)
+            obs_all_coords = np.column_stack([v2_obs_arr, v3_obs_arr])
+            deep_dists, deep_idxs = deep_tree.query(
+                obs_all_coords, distance_upper_bound=strict_tol
+            )
+
+            rev_tree = cKDTree(obs_all_coords)
+            rev_dists, rev_idxs = rev_tree.query(
+                predicted_obs_coords, distance_upper_bound=strict_tol
+            )
+
+            valid_deep = np.zeros(len(v2_obs_arr), dtype=bool)
+            final_catalog_indices = np.zeros(len(v2_obs_arr), dtype=int)
+
+            for o_idx in range(len(v2_obs_arr)):
+                c_idx = deep_idxs[o_idx]
+                if deep_dists[o_idx] < strict_tol:
+                    if rev_idxs[c_idx] == o_idx:
+                        valid_deep[o_idx] = True
+                        final_catalog_indices[o_idx] = c_idx
+
+            valid_strict = valid_deep
+            idx_strict_filt = final_catalog_indices
 
     idx_strict_full = np.zeros_like(idx_strict_filt)
     idx_strict_full[valid_strict] = orig_indices[idx_strict_filt[valid_strict]]
@@ -123,12 +263,6 @@ def _robust_cross_match(
 def _attitude_residuals(
     delta_params, base_ra, base_dec, base_pa, ra_cat, dec_cat, v2_obs, v3_obs
 ):
-    """
-    Objective function for the global Levenberg-Marquardt attitude optimizer.
-    ...
-    """
-
-    # NOTE: delta_params must be treated as physical sky arcseconds
     cos_dec = np.cos(np.deg2rad(base_dec))
     d_ra_deg = (delta_params[0] / 3600.0) / cos_dec
     d_dec_deg = delta_params[1] / 3600.0
@@ -141,11 +275,7 @@ def _attitude_residuals(
         att_matrix, np.asarray(ra_cat), np.asarray(dec_cat)
     )
 
-    # --- THE SPHERICAL FIX ---
-    # 1. Convert reference V3 (arcsec) to radians
     v3_rad = np.deg2rad(v3_calc / 3600.0)
-
-    # 2. Apply the spherical cosine correction to the V2 difference
     dv2 = (v2_calc - v2_obs) * np.cos(v3_rad)
     dv3 = v3_calc - v3_obs
 
@@ -155,47 +285,6 @@ def _attitude_residuals(
 def _fit_sca_alignment(
     v2_obs, v3_obs, v2_cat, v3_cat, v2_fiducial, v3_fiducial, sigma_clip=3.0, max_iter=5
 ):
-    """
-    Computes the affine transformation (shift and rotation) for a single SCA.
-
-    Uses an iterative least-squares solver with sigma clipping to find the optimal
-    dV2, dV3, and dTheta required to align the observed stellar coordinates with
-    the astrometric reference catalog.
-
-    Parameters
-    ----------
-    v2_obs : array_like
-        Observed V2 coordinates of detected stars (arcsec).
-    v3_obs : array_like
-        Observed V3 coordinates of detected stars (arcsec).
-    v2_cat : array_like
-        Reference V2 coordinates from the astrometric catalog (arcsec).
-    v3_cat : array_like
-        Reference V3 coordinates from the astrometric catalog (arcsec).
-    v2_fiducial : float
-        Nominal V2Ref of the SCA aperture to serve as the rotation center.
-    v3_fiducial : float
-        Nominal V3Ref of the SCA aperture to serve as the rotation center.
-    sigma_clip : float, optional
-        Threshold for rejecting outlier matches. Default is 3.0.
-    max_iter : int, optional
-        Maximum number of clipping iterations. Default is 5.
-
-    Returns
-    -------
-    dv2 : float
-        Calculated V2 shift (arcsec).
-    dv3 : float
-        Calculated V3 shift (arcsec).
-    d_theta_deg : float
-        Calculated rotation angle (degrees).
-    dv2_err : float
-        1-sigma formal uncertainty in the V2 shift.
-    dv3_err : float
-        1-sigma formal uncertainty in the V3 shift.
-    theta_err_deg : float
-        1-sigma formal uncertainty in the rotation angle.
-    """
     x_obs = np.asarray(v2_obs) - v2_fiducial
     y_obs = np.asarray(v3_obs) - v3_fiducial
     x_ref = np.asarray(v2_cat) - v2_fiducial
@@ -203,7 +292,6 @@ def _fit_sca_alignment(
 
     valid = np.ones(len(x_obs), dtype=bool)
 
-    # Iterative Sigma Clipping Loop
     for _ in range(max_iter):
         design_matrix = np.column_stack(
             (x_obs[valid], y_obs[valid], np.ones(np.sum(valid)))
@@ -213,30 +301,21 @@ def _fit_sca_alignment(
 
         x_calc = design_matrix @ coeffs_x
         y_calc = design_matrix @ coeffs_y
-
-        # Calculate radial residuals
         dist = np.hypot(x_ref[valid] - x_calc, y_ref[valid] - y_calc)
-        std_dist = np.std(dist)
 
-        if std_dist == 0:
+        med_dist = np.median(dist)
+        mad_dist = np.median(np.abs(dist - med_dist))
+
+        if mad_dist == 0:
             break
 
-        keep = dist < (sigma_clip * std_dist)
-        if np.all(keep):
+        keep = dist < (med_dist + 4.0 * max(mad_dist, 1e-4))
+        if np.all(keep) or np.sum(keep) < 3:
             break
 
-        # ==============================================================
-        # SAFETY CATCH 1: Do not over-clip.
-        # We need at least 3 points to solve an affine transformation.
-        # ==============================================================
-        if np.sum(keep) < 3:
-            break  # Stop clipping, retain the current 'valid' mask
-
-        # Update valid mask
         valid_indices = np.where(valid)[0]
         valid[valid_indices[~keep]] = False
 
-    # Final definitive fit with the safe mask
     design_matrix = np.column_stack(
         (x_obs[valid], y_obs[valid], np.ones(np.sum(valid)))
     )
@@ -246,51 +325,34 @@ def _fit_sca_alignment(
     x_calc = design_matrix @ coeffs_x
     y_calc = design_matrix @ coeffs_y
 
-    # ==============================================================
-    # SAFETY CATCH 2: Handle 0 degrees of freedom (exactly 3 stars)
-    # ==============================================================
     dof = np.sum(valid) - 3
     if dof > 0:
         MSE_x = np.sum((x_ref[valid] - x_calc) ** 2) / dof
         MSE_y = np.sum((y_ref[valid] - y_calc) ** 2) / dof
     else:
-        # If exactly 3 stars remain, the fit is perfectly constrained (MSE = 0)
         MSE_x, MSE_y = 0.0, 0.0
 
-    # ==============================================================
-    # SAFETY CATCH 3: Collinear points causing singular matrix
-    # ==============================================================
     try:
         cov_matrix = np.linalg.inv(design_matrix.T @ design_matrix)
         err_x = np.sqrt(np.diag(cov_matrix) * MSE_x)
         err_y = np.sqrt(np.diag(cov_matrix) * MSE_y)
     except np.linalg.LinAlgError:
-        # Fallback if the remaining stars are arranged in a perfectly straight line
         err_x = np.array([np.nan, np.nan, np.nan])
         err_y = np.array([np.nan, np.nan, np.nan])
 
     dv2, dv2_err = coeffs_x[2], err_x[2]
     dv3, dv3_err = coeffs_y[2], err_y[2]
 
-    # Extract Rotation
     sin_theta = (coeffs_y[0] - coeffs_x[1]) / 2.0
     d_theta_deg = np.degrees(np.arcsin(np.clip(sin_theta, -1.0, 1.0)))
-    theta_err_deg = np.degrees(np.sqrt(err_y[0] ** 2 + err_x[1] ** 2) / 2.0)
 
-    # ------------------------------------------------------------------------------
-    # Extract Scale (Magnification) and Skew
-    # A perfect, un-distorted match would have coeffs_x[0] = 1.0 and coeffs_y[1] = 1.0
     scale_x = coeffs_x[0]
     scale_y = coeffs_y[1]
     skew = (coeffs_x[1] + coeffs_y[0]) / 2.0
 
-    # Calculate final RMS of the fit (in mas)
-    final_rms_mas = (
-        np.std(np.hypot(x_ref[valid] - x_calc, y_ref[valid] - y_calc)) * 1000.0
-    )
-    # ------------------------------------------------------------------------------
-    # return dv2, dv3, d_theta_deg, dv2_err, dv3_err, theta_err_deg
-
+    dx = x_ref[valid] - x_calc
+    dy = y_ref[valid] - y_calc
+    final_rms_mas = np.sqrt(np.mean(dx**2 + dy**2)) * 1000.0
     return dv2, dv3, d_theta_deg, scale_x, scale_y, skew, final_rms_mas
 
 
@@ -301,11 +363,15 @@ def align_wfi(
     user_offsets=None,
     max_iterations=5,
     debug=False,
+    precomputed_matches_dir="roman_gaia_match",
+    target_wfi_cen=None,
+    roman_siaf=None,
+    fit_degree=4,  # Default to Full Polynomial
 ):
-    # Suppress the specific Gaia DR4 warning
     warnings.filterwarnings("ignore", message=".*Gaia archive is in evolution.*")
 
-    roman_siaf = pysiaf.Siaf("Roman")
+    if roman_siaf is None:
+        roman_siaf = pysiaf.Siaf("Roman")
     user_offsets = user_offsets or {}
     cos_dec = np.cos(np.deg2rad(pointing_info["DEC_V1"]))
 
@@ -319,77 +385,66 @@ def align_wfi(
         user_offsets.get("d_pa_arcsec", 0.0) / 3600.0
     )
 
-    # Extract Gaia magnitudes ONCE before any loops
-    mag_gaia = (
-        np.asarray(ref_catalog["phot_g_mean_mag"])
-        if "phot_g_mean_mag" in ref_catalog.colnames
-        else None
-    )
-
-    # =========================================================================
-    # MACRO-ALIGNMENT LOOP
-    # =========================================================================
+    precomputed_matches = load_standalone_matches(precomputed_matches_dir)
     iteration_history = []
     pbar = tqdm(range(max_iterations), desc="Solving Global Attitude")
+
+    # -------------------------------------------------------------------------
+    # ITERATIVE GLOBAL ATTITUDE SOLVER
+    # -------------------------------------------------------------------------
     for i in pbar:
         att_matrix = pysiaf.utils.rotations.attitude(
             0, 0, current_ra, current_dec, current_pa
         )
-        v2_gaia, v3_gaia = pysiaf.utils.rotations.getv2v3(
-            att_matrix,
-            np.asarray(ref_catalog["ra_epoch"]),
-            np.asarray(ref_catalog["dec_epoch"]),
-        )
-
         global_v2_obs, global_v3_obs, global_ra_ref, global_dec_ref = [], [], [], []
         valid_scas_found = 0
 
-        if debug and i == 0:
-            print(f"\n--- DEBUG LOG: Iteration {i} ---")
-
-        # Initialize a list to track which SCAs successfully survived the fit
-
         for aper_name, catalog in phot_catalogs.items():
             aper = roman_siaf[aper_name]
-
             if not aper:
                 continue
 
-            v2_obs, v3_obs = aper.sci_to_tel(catalog["x"] + 1, catalog["y"] + 1)
-            flux_obs = catalog["flux"] if "flux" in catalog.colnames else None
+            # --- DIRECT INJECTION OF EXACT MATCHES ---
+            if precomputed_matches and aper_name in precomputed_matches:
+                x_obs_1based = precomputed_matches[aper_name]["x_obs"]
+                y_obs_1based = precomputed_matches[aper_name]["y_obs"]
 
-            tol = 20.0 if i == 0 else 2.0
+                v2_obs, v3_obs = aper.sci_to_tel(x_obs_1based, y_obs_1based)
 
-            valid, idx, dv2_bulk, dv3_bulk = _robust_cross_match(
-                v2_obs,
-                v3_obs,
-                v2_gaia,
-                v3_gaia,
-                flux_obs=flux_obs,
-                mag_cat=mag_gaia,
-                broad_tol=tol,
-                strict_tol=1.0,
-            )
+                valid_scas_found += 1
+                global_v2_obs.extend(v2_obs)
+                global_v3_obs.extend(v3_obs)
+                global_ra_ref.extend(precomputed_matches[aper_name]["ra_cat"])
+                global_dec_ref.extend(precomputed_matches[aper_name]["dec_cat"])
 
-            if debug and i == 0:
-                print(
-                    f'  [{aper_name}] Histogram Shift -> dV2: {dv2_bulk:6.2f}", dV3: {dv3_bulk:6.2f}" | Strict Matches: {np.sum(valid)}'
+            else:
+                # Fallback to KD-tree guessing
+                v2_obs, v3_obs = aper.sci_to_tel(catalog["x"] + 1, catalog["y"] + 1)
+                flux_obs = catalog["flux"] if "flux" in catalog.colnames else None
+                tol = 300.0 if i == 0 else 20.0 if i == 1 else 10.0
+                strict_tol = 5.0 if i == 0 else 3.0 if i < 3 else 1.0
+
+                valid, idx, _, _ = _robust_cross_match(
+                    v2_obs,
+                    v3_obs,
+                    v2_gaia,
+                    v3_gaia,
+                    flux_obs=flux_obs,
+                    mag_cat=mag_gaia,
+                    broad_tol=tol,
+                    strict_tol=strict_tol,
+                    is_wfi01=("WFI01" in aper_name),
                 )
 
-            if np.sum(valid) > 5:
-                valid_scas_found += 1
+                if np.sum(valid) > 5:
+                    valid_scas_found += 1
+                    valid_indices = np.where(valid)[0]
+                    global_v2_obs.extend(v2_obs[valid_indices])
+                    global_v3_obs.extend(v3_obs[valid_indices])
+                    global_ra_ref.extend(ref_catalog["ra_epoch"][idx[valid_indices]])
+                    global_dec_ref.extend(ref_catalog["dec_epoch"][idx[valid_indices]])
 
-                # --- SPEED HACK: Sub-sample to 50 stars max per SCA ---
-                valid_indices = np.where(valid)[0][:50]
-
-                global_v2_obs.extend(v2_obs[valid_indices])
-                global_v3_obs.extend(v3_obs[valid_indices])
-                global_ra_ref.extend(ref_catalog["ra_epoch"][idx[valid_indices]])
-                global_dec_ref.extend(ref_catalog["dec_epoch"][idx[valid_indices]])
-
-        print(f"  -> Iteration {i + 1}: Matched {valid_scas_found}/18 SCAs.")
-
-        bounds = ([-60.0, -60.0, -1800.0], [60.0, 60.0, 1800.0])
+        bounds = ([-300.0, -300.0, -1800.0], [300.0, 300.0, 1800.0])
         global_result = least_squares(
             _attitude_residuals,
             [0.0, 0.0, 0.0],
@@ -399,8 +454,8 @@ def align_wfi(
                 current_pa,
                 np.asarray(global_ra_ref),
                 np.asarray(global_dec_ref),
-                global_v2_obs,
-                global_v3_obs,
+                np.asarray(global_v2_obs),
+                np.asarray(global_v3_obs),
             ),
             method="trf",
             loss="linear" if i == 0 else "soft_l1",
@@ -411,27 +466,17 @@ def align_wfi(
         )
 
         d_ra, d_dec, d_pa = global_result.x
-
-        if debug and i == 0:
-            print(
-                f'  [SOLVER] Raw Optimizer Output -> dRA: {d_ra:6.2f}", dDec: {d_dec:6.2f}", dPA: {d_pa:6.2f}"'
-            )
-            print("--------------------------------\n")
-
-        current_ra += (d_ra / 3600.0) / cos_dec
-        current_dec += d_dec / 3600.0
-        current_pa = (current_pa + d_pa / 3600.0) % 360.0
+        learning_rate = 1.0 if i < 2 else (1.0 / (i + 1))
+        current_ra += learning_rate * ((d_ra / 3600.0) / cos_dec)
+        current_dec += learning_rate * (d_dec / 3600.0)
+        current_pa = (current_pa + learning_rate * (d_pa / 3600.0)) % 360.0
 
         step_mag_arcsec = np.sqrt(d_ra**2 + d_dec**2)
         iteration_history.append(step_mag_arcsec)
-
         pbar.set_postfix({"Res_Mag_arcsec": f"{step_mag_arcsec:.3f}"})
         if np.sqrt(d_ra**2 + d_dec**2 + d_pa**2) < 0.001:
             break
 
-    # =========================================================================
-    # POST-OPTIMIZATION & FINAL DIAGNOSTIC SUITE
-    # =========================================================================
     diag_dir = "diagnostics"
     os.makedirs(diag_dir, exist_ok=True)
 
@@ -443,298 +488,189 @@ def align_wfi(
     locked_att_matrix = pysiaf.utils.rotations.attitude(
         0, 0, current_ra, current_dec, current_pa
     )
-    v2_gaia_locked, v3_gaia_locked = pysiaf.utils.rotations.getv2v3(
-        locked_att_matrix,
-        np.asarray(ref_catalog["ra_epoch"]),
-        np.asarray(ref_catalog["dec_epoch"]),
-    )
 
+    # -------------------------------------------------------------------------
+    # LOCAL SCA FITTING & DIAGNOSTIC LOGGING
+    # -------------------------------------------------------------------------
     calibrated_siaf_params = {}
     summary_log_data = []
     matched_pairs_log_data = []
-    all_matched_flux = []
-    all_matched_mag = []
-
-    # Initialize a list to track which SCAs successfully survived the fit
     successfully_fitted_scas = []
 
-    # Final Local SCA Alignment Loop
     for aper_name, catalog in phot_catalogs.items():
         aper = roman_siaf[aper_name]
-        v2_obs, v3_obs = aper.sci_to_tel(catalog["x"] + 1, catalog["y"] + 1)
-        flux_obs = catalog["flux"] if "flux" in catalog.colnames else None
 
-        valid, idx, dv2_bulk, dv3_bulk = _robust_cross_match(
-            v2_obs,
-            v3_obs,
-            v2_gaia_locked,
-            v3_gaia_locked,
-            flux_obs=flux_obs,
-            mag_cat=mag_gaia,
-            broad_tol=5.0,
-            strict_tol=1.0,
-        )
+        if precomputed_matches and aper_name in precomputed_matches:
+            x_obs_1based = precomputed_matches[aper_name]["x_obs"]
+            y_obs_1based = precomputed_matches[aper_name]["y_obs"]
 
-        num_matched = np.sum(valid)
-        summary_log_data.append(
-            [
-                aper_name,
-                len(v2_obs),
-                num_matched,
-                round(dv2_bulk, 3),
-                round(dv3_bulk, 3),
-            ]
-        )
-
-        if num_matched < 5:
-            print(
-                f"\n  -> [{aper_name}] Failed: Insufficient stars ({num_matched}). Reverting to default SIAF."
+            v2_obs, v3_obs = aper.sci_to_tel(x_obs_1based, y_obs_1based)
+            v2_ref_fit, v3_ref_fit = pysiaf.utils.rotations.getv2v3(
+                locked_att_matrix,
+                precomputed_matches[aper_name]["ra_cat"],
+                precomputed_matches[aper_name]["dec_cat"],
             )
-            # We explicitly add the dead SCA to the dictionary with its default baseline geometry
-            # so it still gets exported to the YAML file!
+
+            log_x_fit, log_y_fit = x_obs_1based - 1, y_obs_1based - 1
+            log_ra_fit, log_dec_fit = (
+                precomputed_matches[aper_name]["ra_cat"],
+                precomputed_matches[aper_name]["dec_cat"],
+            )
+            log_f_fit, log_m_fit = (
+                np.full(len(x_obs_1based), np.nan),
+                precomputed_matches[aper_name]["mag_cat"],
+            )
+
+            num_matched = len(v2_ref_fit)
+            dv2_bulk = np.median(v2_ref_fit - v2_obs) if num_matched > 0 else 0.0
+            dv3_bulk = np.median(v3_ref_fit - v3_obs) if num_matched > 0 else 0.0
+            summary_log_data.append(
+                [
+                    aper_name,
+                    len(v2_obs),
+                    num_matched,
+                    round(dv2_bulk, 3),
+                    round(dv3_bulk, 3),
+                ]
+            )
+
+            if num_matched < 15:
+                calibrated_siaf_params[aper_name] = {
+                    "V2Ref": aper.V2Ref,
+                    "V3Ref": aper.V3Ref,
+                    "V3IdlYAngle": aper.V3IdlYAngle,
+                }
+                continue
+
+            # Lock the local reference frame origins using the affine fit
+            dv2, dv3, d_theta, scale_x, scale_y, skew, sca_rms = _fit_sca_alignment(
+                v2_obs, v3_obs, v2_ref_fit, v3_ref_fit, aper.V2Ref, aper.V3Ref
+            )
+            aper.V2Ref += dv2
+            aper.V3Ref += dv3
+            aper.V3IdlYAngle -= d_theta
+
             calibrated_siaf_params[aper_name] = {
                 "V2Ref": aper.V2Ref,
                 "V3Ref": aper.V3Ref,
                 "V3IdlYAngle": aper.V3IdlYAngle,
             }
-            continue  # Skip the dynamic distortion math and move to the next chip
+            poly_coeffs = aper.get_polynomial_coefficients()
 
-        valid_indices = np.where(valid)[0]
+            if fit_degree == 4:
+                # Extract target Ideal coordinates using the newly locked frame
+                x_idl_ref, y_idl_ref = aper.tel_to_idl(v2_ref_fit, v3_ref_fit)
 
-        # --- DIAGNOSTIC: DS9 Region File (.reg) ---
-        reg_filename = os.path.join(diag_dir, f"matched_gaia_{aper_name}.reg")
-        with open(reg_filename, "w") as f_reg:
-            f_reg.write("# Region file format: DS9 version 4.1\n")
-            f_reg.write(
-                'global color=green dashlist=8 3 width=2 font="helvetica 10 normal roman" select=1 highlite=1 dash=0 fixed=0 edit=1 move=1 delete=1 include=1 source=1\n'
-            )
-            f_reg.write("image\n")
-            x_g, y_g = aper.tel_to_sci(
-                v2_gaia_locked[idx[valid]], v3_gaia_locked[idx[valid]]
-            )
-            for xi, yi in zip(x_g, y_g):
-                f_reg.write(f"circle({xi:.2f},{yi:.2f},5)\n")
+                # Fit using ALL available matched stars (removed train/test split)
+                cx, cy, valid_mask = fit_full_distortion(
+                    x_obs_1based,
+                    y_obs_1based,
+                    x_idl_ref,
+                    y_idl_ref,
+                    aper.XSciRef,
+                    aper.YSciRef,
+                    degree=4,
+                )
+                cx_inv, cy_inv = fit_inverse_distortion(
+                    x_idl_ref,
+                    y_idl_ref,
+                    x_obs_1based,
+                    y_obs_1based,
+                    aper.XSciRef,
+                    aper.YSciRef,
+                    valid_mask,
+                    degree=4,
+                )
 
-        # --- DIAGNOSTIC: Constellation Overlay Plot ---
-        plt.figure(figsize=(10, 10))
-        plt.scatter(
-            v2_gaia_locked[idx[valid]],
-            v3_gaia_locked[idx[valid]],
-            c="blue",
-            marker="+",
-            s=60,
-            label="Gaia Ref",
-            alpha=0.6,
-        )
-        plt.scatter(
-            np.asarray(v2_obs)[valid] + dv2_bulk,
-            np.asarray(v3_obs)[valid] + dv3_bulk,
-            facecolors="none",
-            edgecolors="red",
-            s=60,
-            label="Roman Obs (Shifted)",
-        )
-        for v_i in valid_indices:
-            plt.plot(
-                [v2_obs[v_i] + dv2_bulk, v2_gaia_locked[idx[v_i]]],
-                [v3_obs[v_i] + dv3_bulk, v3_gaia_locked[idx[v_i]]],
-                "g-",
-                alpha=0.4,
-            )
-        plt.title(f"Constellation Match: {aper_name}\n({num_matched} stars matched)")
-        plt.xlabel("V2 (arcsec)")
-        plt.ylabel("V3 (arcsec)")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(
-            os.path.join(diag_dir, f"constellation_{aper_name}.png"),
-            bbox_inches="tight",
-        )
-        plt.close()
+                # Wipe and Replace PySIAF Distortion Maps
+                num_fitted_terms = len(cx)
+                for i in range(num_fitted_terms):
+                    poly_coeffs["Sci2IdlX"][i] = cx[i]
+                    poly_coeffs["Sci2IdlY"][i] = cy[i]
+                    poly_coeffs["Idl2SciX"][i] = cx_inv[i]
+                    poly_coeffs["Idl2SciY"][i] = cy_inv[i]
 
-        # --- Gather data for Matched Pairs Log and Photometry ---
-        for v_i in valid_indices:
-            ref_idx = idx[v_i]
+                for i in range(num_fitted_terms, len(poly_coeffs["Sci2IdlX"])):
+                    poly_coeffs["Sci2IdlX"][i] = 0.0
+                    poly_coeffs["Sci2IdlY"][i] = 0.0
+                    poly_coeffs["Idl2SciX"][i] = 0.0
+                    poly_coeffs["Idl2SciY"][i] = 0.0
 
-            # The calibrated observed V2/V3 (what the FGS function expects)
-            v2_cal = v2_obs[v_i] + dv2_bulk
-            v3_cal = v3_obs[v_i] + dv3_bulk
+            elif fit_degree == 1:
+                # Standard Affine Mode (Scale & Skew updates)
+                scale_error = max(abs(scale_x - 1.0), abs(scale_y - 1.0))
+                skew_error = abs(skew)
 
-            # The residuals relative to the locked Gaia positions (for logging)
-            res_v2 = v2_cal - v2_gaia_locked[ref_idx]
-            res_v3 = v3_cal - v3_gaia_locked[ref_idx]
+                if scale_error > 5e-5 or skew_error > 5e-5:
+                    poly_coeffs["Sci2IdlX"][1] *= scale_x
+                    poly_coeffs["Sci2IdlX"][2] += skew
+                    poly_coeffs["Sci2IdlY"][1] += skew
+                    poly_coeffs["Sci2IdlY"][2] *= scale_y
 
-            f_val = flux_obs[v_i] if flux_obs is not None else np.nan
-            m_val = mag_gaia[ref_idx] if mag_gaia is not None else np.nan
+                    M_forward = np.array(
+                        [
+                            [poly_coeffs["Sci2IdlX"][1], poly_coeffs["Sci2IdlX"][2]],
+                            [poly_coeffs["Sci2IdlY"][1], poly_coeffs["Sci2IdlY"][2]],
+                        ]
+                    )
+                    M_inverse = np.linalg.inv(M_forward)
+                    poly_coeffs["Idl2SciX"][1] = M_inverse[0, 0]
+                    poly_coeffs["Idl2SciX"][2] = M_inverse[0, 1]
+                    poly_coeffs["Idl2SciY"][1] = M_inverse[1, 0]
+                    poly_coeffs["Idl2SciY"][2] = M_inverse[1, 1]
 
-            matched_pairs_log_data.append(
-                [
-                    aper_name,
-                    round(catalog["x"][v_i], 2),
-                    round(catalog["y"][v_i], 2),
-                    round(ref_catalog["ra_epoch"][ref_idx], 6),
-                    round(ref_catalog["dec_epoch"][ref_idx], 6),
-                    f_val,
-                    m_val,
-                    round(v2_cal, 4),
-                    round(v3_cal, 4),
-                    round(res_v2 * 1000, 2),
-                    round(res_v3 * 1000, 2),
-                ]
-            )
-
-            if not np.isnan(f_val) and not np.isnan(m_val) and m_val != 99.0:
-                all_matched_flux.append(f_val)
-                all_matched_mag.append(m_val)
-
-        # ---------------------------------------------------------------------
-        # THE DYNAMIC DISTORTION EVALUATOR
-        # ---------------------------------------------------------------------
-        dv2, dv3, d_theta, scale_x, scale_y, skew, sca_rms = _fit_sca_alignment(
-            v2_obs[valid],
-            v3_obs[valid],
-            v2_gaia_locked[idx[valid]],
-            v3_gaia_locked[idx[valid]],
-            aper.V2Ref,
-            aper.V3Ref,
-        )
-
-        # Retrieve the Roman polynomial coefficient arrays
-        poly_coeffs = aper.get_polynomial_coefficients()
-
-        # Initialize our dictionary entry with the standard 3-parameter updates
-        calibrated_siaf_params[aper_name] = {
-            "V2Ref": aper.V2Ref + dv2,
-            "V3Ref": aper.V3Ref + dv3,
-            "V3IdlYAngle": aper.V3IdlYAngle + d_theta,
-            "Sci2IdlX10": poly_coeffs["Sci2IdlX"][1],
-            "Sci2IdlX01": poly_coeffs["Sci2IdlX"][2],
-            "Sci2IdlY10": poly_coeffs["Sci2IdlY"][1],
-            "Sci2IdlY01": poly_coeffs["Sci2IdlY"][2],
-            "Idl2SciX10": poly_coeffs["Idl2SciX"][1],
-            "Idl2SciX01": poly_coeffs["Idl2SciX"][2],
-            "Idl2SciY10": poly_coeffs["Idl2SciY"][1],
-            "Idl2SciY01": poly_coeffs["Idl2SciY"][2],
-        }
-
-        # THE METRIC: Did the physical scale or skew diverge from the PySIAF model?
-        # A deviation of 5e-5 (50 ppm) creates a >10 mas error at the chip edge.
-        scale_error = max(abs(scale_x - 1.0), abs(scale_y - 1.0))
-        skew_error = abs(skew)
-
-        if scale_error > 5e-5 or skew_error > 5e-5:
-            print(f"\n  -> [{aper_name}] Scale/Skew anomaly detected.")
-            print(
-                f"     Scale X: {scale_x:.6f}, Scale Y: {scale_y:.6f}, Skew: {skew:.6f}"
-            )
-            print("     Dynamically updating linear SIAF polynomials...")
-
-            # 1. Update the specific linear indices in our extracted arrays
-            poly_coeffs["Sci2IdlX"][1] *= scale_x
-            poly_coeffs["Sci2IdlX"][2] += skew
-            poly_coeffs["Sci2IdlY"][1] += skew
-            poly_coeffs["Sci2IdlY"][2] *= scale_y
-
-            # Build the 2x2 forward transformation matrix
-            M_forward = np.array(
-                [
-                    [poly_coeffs["Sci2IdlX"][1], poly_coeffs["Sci2IdlX"][2]],
-                    [poly_coeffs["Sci2IdlY"][1], poly_coeffs["Sci2IdlY"][2]],
-                ]
-            )
-            # Invert it to get the backward coefficients
-            M_inverse = np.linalg.inv(M_forward)
-            poly_coeffs["Idl2SciX"][1] = M_inverse[0, 0]
-            poly_coeffs["Idl2SciX"][2] = M_inverse[0, 1]
-            poly_coeffs["Idl2SciY"][1] = M_inverse[1, 0]
-            poly_coeffs["Idl2SciY"][2] = M_inverse[1, 1]
-
-            # 2. Update the dictionary for YAML export
-            calibrated_siaf_params[aper_name].update(
-                {
-                    "Sci2IdlX10": poly_coeffs["Sci2IdlX"][1],
-                    "Sci2IdlX01": poly_coeffs["Sci2IdlX"][2],
-                    "Sci2IdlY10": poly_coeffs["Sci2IdlY"][1],
-                    "Sci2IdlY01": poly_coeffs["Sci2IdlY"][2],
-                    "Idl2SciX10": poly_coeffs["Idl2SciX"][1],
-                    "Idl2SciX01": poly_coeffs["Idl2SciX"][2],
-                    "Idl2SciY10": poly_coeffs["Idl2SciY"][1],
-                    "Idl2SciY01": poly_coeffs["Idl2SciY"][2],
-                }
-            )
-
-            # 3. Inject the updated arrays back into the PySIAF aperture
+            # Update Aperture and store populated terms for YAML Export
             lower_poly_coeffs = {k.lower(): v for k, v in poly_coeffs.items()}
             aper.set_polynomial_coefficients(**lower_poly_coeffs)
 
-            # 4. Re-calculate the observed coordinates with the bent math
-            x_idl = np.asarray(v2_obs) - aper.V2Ref
-            y_idl = np.asarray(v3_obs) - aper.V3Ref
+            mapping = {}
+            idx = 0
+            for d in range(6):
+                for y_deg in range(d + 1):
+                    mapping[idx] = f"{d - y_deg}{y_deg}"
+                    idx += 1
 
-            v2_obs_fixed = aper.V2Ref + (x_idl * scale_x + y_idl * skew + dv2)
-            v3_obs_fixed = aper.V3Ref + (x_idl * skew + y_idl * scale_y + dv3)
+            for i in range(len(poly_coeffs["Sci2IdlX"])):
+                suffix = mapping[i]
+                calibrated_siaf_params[aper_name][f"Sci2IdlX{suffix}"] = poly_coeffs[
+                    "Sci2IdlX"
+                ][i]
+                calibrated_siaf_params[aper_name][f"Sci2IdlY{suffix}"] = poly_coeffs[
+                    "Sci2IdlY"
+                ][i]
+                calibrated_siaf_params[aper_name][f"Idl2SciX{suffix}"] = poly_coeffs[
+                    "Idl2SciX"
+                ][i]
+                calibrated_siaf_params[aper_name][f"Idl2SciY{suffix}"] = poly_coeffs[
+                    "Idl2SciY"
+                ][i]
 
-            v2_obs = v2_obs_fixed
-            v3_obs = v3_obs_fixed
+            # --- CALCULATE TRUE RESIDUALS IMMEDIATELY (VECTORIZED) ---
+            # Evaluate final pre-shift coordinates for accurate physical residual math
+            v2_cal_final, v3_cal_final = aper.sci_to_tel(
+                log_x_fit + 1.0, log_y_fit + 1.0
+            )
+            res_v2_mas = (v2_cal_final - v2_ref_fit) * 1000.0
+            res_v3_mas = (v3_cal_final - v3_ref_fit) * 1000.0
 
-        successfully_fitted_scas.append(aper_name)
+            for j in range(num_matched):
+                matched_pairs_log_data.append(
+                    [
+                        aper_name,
+                        round(log_x_fit[j], 2),
+                        round(log_y_fit[j], 2),
+                        round(log_ra_fit[j], 6),
+                        round(log_dec_fit[j], 6),
+                        log_f_fit[j],
+                        log_m_fit[j],
+                        round(float(v2_cal_final[j]), 4),
+                        round(float(v3_cal_final[j]), 4),
+                        round(float(res_v2_mas[j]), 2),
+                        round(float(res_v3_mas[j]), 2),
+                    ]
+                )
 
-    # =========================================================================
-    # DIAGNOSTIC LOG EXPORTS & SUMMARY PLOT
-    # =========================================================================
-    with open(os.path.join(diag_dir, "alignment_summary.csv"), "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "SCA_Name",
-                "Total_Obs_Stars",
-                "Matched_Stars",
-                "Bulk_Shift_V2_arcsec",
-                "Bulk_Shift_V3_arcsec",
-            ]
-        )
-        writer.writerows(summary_log_data)
-
-    with open(os.path.join(diag_dir, "matched_pairs.csv"), "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "SCA",
-                "X_pixel",
-                "Y_pixel",
-                "Gaia_RA_deg",
-                "Gaia_Dec_deg",
-                "Roman_Flux",
-                "Gaia_G_Mag",
-                "Res_V2_mas",
-                "Res_V3_mas",
-            ]
-        )
-        writer.writerows(matched_pairs_log_data)
-
-    if all_matched_flux and all_matched_mag:
-        plt.figure(figsize=(8, 6))
-        plt.scatter(
-            all_matched_mag, np.log10(all_matched_flux), alpha=0.5, s=15, c="purple"
-        )
-        plt.title("Photometric Sanity Check: All Matched Pairs")
-        plt.xlabel("Gaia G-Band Magnitude")
-        plt.ylabel("Log10(Roman Instrumental Flux)")
-        plt.gca().invert_xaxis()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(
-            os.path.join(diag_dir, "photometry_sanity_check.png"), bbox_inches="tight"
-        )
-        plt.close()
-
-    print(
-        f"\n  -> Diagnostic suite generated in ./{diag_dir}/ (Logs, DS9 .reg files, and PNG overlays)."
-    )
-
-    # =========================================================================
-    # ATTITUDE RESULTS INITIALIZATION & DIAGNOSTICS
-    # =========================================================================
-    valid_scas = list(calibrated_siaf_params.keys())
+            successfully_fitted_scas.append(aper_name)
 
     attitude_results = {
         "RA_V1": current_ra,
@@ -745,12 +681,7 @@ def align_wfi(
         "PA_V3_err_arcsec": att_err_arcsec[2],
     }
 
-    # =========================================================================
-    # THE ZERO-MEAN CONSTRAINT (FAULT-TOLERANT FIXED ANCHOR PRINCIPLE)
-    # =========================================================================
-    # Only calculate the global plate shift using the SCAs that actually solved
     if len(successfully_fitted_scas) > 0:
-        # 1. Calculate the mean shift using ONLY the healthy chips
         mean_dv2 = np.mean(
             [
                 calibrated_siaf_params[s]["V2Ref"] - roman_siaf[s].V2Ref
@@ -770,102 +701,128 @@ def align_wfi(
             ]
         )
 
-        # 2. Apply the constraint ONLY to the healthy chips
         for s in successfully_fitted_scas:
             calibrated_siaf_params[s]["V2Ref"] -= mean_dv2
             calibrated_siaf_params[s]["V3Ref"] -= mean_dv3
             calibrated_siaf_params[s]["V3IdlYAngle"] -= mean_dtheta
 
-        # 3. LOG THE ABSORBED SHIFT FOR THE BAM
         attitude_results["Residual_Mean_V2_mas"] = mean_dv2 * 1000.0
         attitude_results["Residual_Mean_V3_mas"] = mean_dv3 * 1000.0
-
-        # 4. INJECT THE SHIFT INTO THE SPACECRAFT POINTING
         attitude_results["RA_V1"] += (mean_dv2 / 3600.0) / cos_dec
         attitude_results["DEC_V1"] += mean_dv3 / 3600.0
-        attitude_results["PA_V3"] += mean_dtheta / 3600.0
+        attitude_results["PA_V3"] += (
+            mean_dtheta / 3600.0
+        )  # Proper absolute mapping parity
 
-    else:
-        print(
-            "\nCRITICAL WARNING: 0/18 SCAs solved. Boresight update will rely purely on Global Fit."
+    if target_wfi_cen is not None:
+        bam_v2_cen = target_wfi_cen["V2"]
+        bam_v3_cen = target_wfi_cen["V3"]
+        bam_angle_cen = target_wfi_cen["Angle"]
+
+        nom_v2_cen, nom_v3_cen, nom_angle_cen = (
+            roman_siaf["WFI_CEN"].V2Ref,
+            roman_siaf["WFI_CEN"].V3Ref,
+            roman_siaf["WFI_CEN"].V3IdlYAngle,
         )
+        dtheta_rad = np.deg2rad(bam_angle_cen - nom_angle_cen)
+        cos_t, sin_t = np.cos(dtheta_rad), np.sin(dtheta_rad)
 
-    print("\n--- Alignment Diagnostics Summary ---")
-    print(
-        f"Global Fit RMS Residual: {np.sqrt(np.mean(global_result.fun**2)):.4f} arcsec"
-    )
-    print(f"Successful SCA Fits: {len(successfully_fitted_scas)}/18")
+        for sca in successfully_fitted_scas:
+            dx, dy = (
+                calibrated_siaf_params[sca]["V2Ref"] - nom_v2_cen,
+                calibrated_siaf_params[sca]["V3Ref"] - nom_v3_cen,
+            )
+            calibrated_siaf_params[sca]["V2Ref"] = bam_v2_cen + (
+                dx * cos_t - dy * sin_t
+            )
+            calibrated_siaf_params[sca]["V3Ref"] = bam_v3_cen + (
+                dx * sin_t + dy * cos_t
+            )
+            calibrated_siaf_params[sca]["V3IdlYAngle"] += bam_angle_cen - nom_angle_cen
 
-    if "Residual_Mean_V2_mas" in attitude_results:
-        print(
-            f"Detector Plate Mean Shift (V2): {attitude_results['Residual_Mean_V2_mas']:.3f} mas"
-        )
-        print(
-            f"Detector Plate Mean Shift (V3): {attitude_results['Residual_Mean_V3_mas']:.3f} mas"
-        )
-    print("--------------------------------------\n")
+        calibrated_siaf_params["WFI_CEN"] = {
+            "V2Ref": bam_v2_cen,
+            "V3Ref": bam_v3_cen,
+            "V3IdlYAngle": bam_angle_cen,
+        }
 
-    print("  -> Generating diagnostic plots...")
+    # Vectorized post-calibration logging & diagnostic evaluation
+    diagnostic_log = []
+    rows_by_sca = {}
+    for row in matched_pairs_log_data:
+        sca_name = row[0]
+        if sca_name not in rows_by_sca:
+            rows_by_sca[sca_name] = []
+        rows_by_sca[sca_name].append(row)
+
+    for sca_name, rows in rows_by_sca.items():
+        aper = roman_siaf[sca_name]
+        aper.V2Ref = calibrated_siaf_params[sca_name]["V2Ref"]
+        aper.V3Ref = calibrated_siaf_params[sca_name]["V3Ref"]
+        aper.V3IdlYAngle = calibrated_siaf_params[sca_name]["V3IdlYAngle"]
+
+        x_pix = np.array([r[1] for r in rows]) + 1.0
+        y_pix = np.array([r[2] for r in rows]) + 1.0
+
+        final_v2, final_v3 = aper.sci_to_tel(x_pix, y_pix)
+
+        for i, r in enumerate(rows):
+            new_row = list(r)
+            # Update ONLY the plotting coordinates (indices 7 and 8) so they track with WFI_CEN
+            new_row[7] = round(float(final_v2[i]), 4)
+            new_row[8] = round(float(final_v3[i]), 4)
+            # Do NOT recalculate residuals here; the true physics were already locked above!
+            diagnostic_log.append(new_row)
+
     generate_alignment_diagnostics(
-        matched_pairs_log=matched_pairs_log_data,
-        iteration_history=iteration_history,  # e.g., [11.2, 0.49, 0.03, 0.03, 0.04]
+        matched_pairs_log=diagnostic_log,
+        iteration_history=iteration_history,
         output_dir="./diagnostics",
+        calibrated_siaf_params=calibrated_siaf_params,
     )
 
-    return calibrated_siaf_params, attitude_results, matched_pairs_log_data
+    return calibrated_siaf_params, attitude_results, diagnostic_log
 
 
 def export_alignment_to_yaml(calibrated_siaf_params, output_prefix="roman_wfi_updates"):
-    """
-    Exports the calibrated SIAF parameters to a YAML file for PRD XML conversion.
-
-    Parses the calibrated parameter dictionary and generates a flat, precisely
-    formatted YAML file containing V2Ref, V3Ref, and V3IdlYAngle updates. It
-    automatically appends a YYYYMMDD date stamp to both the file name and the
-    internal version metadata.
-
-    Parameters
-    ----------
-    calibrated_siaf_params : dict
-        Dictionary mapping SCA names to their updated geometric parameters.
-    output_prefix : str, optional
-        Prefix for the output filename. Default is "roman_wfi_updates".
-
-    Returns
-    -------
-    output_filename : str
-        The full name of the generated file (e.g., 'roman_wfi_updates_20260526.yml').
-    """
     current_date = datetime.now().strftime("%Y%m%d")
     output_filename = f"{output_prefix}_{current_date}.yml"
     yaml_lines = [f"version: '{current_date}'"]
 
-    # Sort the keys to ensure WFI01 through WFI18 are printed in order
+    mapping = {}
+    idx = 0
+    for d in range(6):
+        for y_deg in range(d + 1):
+            mapping[idx] = f"{d - y_deg}{y_deg}"
+            idx += 1
+
     for sca_name in sorted(calibrated_siaf_params.keys()):
         formatted_name = sca_name if "_FULL" in sca_name else f"{sca_name}_FULL"
         yaml_lines.append(f"{formatted_name}:")
-
         params = calibrated_siaf_params[sca_name]
         yaml_lines.append(f"  V2Ref: {params['V2Ref']:.3f}")
         yaml_lines.append(f"  V3Ref: {params['V3Ref']:.3f}")
         yaml_lines.append(f"  V3IdlYAngle: {params['V3IdlYAngle']:.5f}")
 
-        # --- Export Linear Distortion terms (Forward and Inverse) ---
         if "Sci2IdlX10" in params:
-            yaml_lines.append(f"  Sci2IdlX10: {params['Sci2IdlX10']:.8e}")
-            yaml_lines.append(f"  Sci2IdlX01: {params['Sci2IdlX01']:.8e}")
-            yaml_lines.append(f"  Sci2IdlY10: {params['Sci2IdlY10']:.8e}")
-            yaml_lines.append(f"  Sci2IdlY01: {params['Sci2IdlY01']:.8e}")
-
-            yaml_lines.append(f"  Idl2SciX10: {params['Idl2SciX10']:.8e}")
-            yaml_lines.append(f"  Idl2SciX01: {params['Idl2SciX01']:.8e}")
-            yaml_lines.append(f"  Idl2SciY10: {params['Idl2SciY10']:.8e}")
-            yaml_lines.append(f"  Idl2SciY01: {params['Idl2SciY01']:.8e}")
+            for i in range(21):
+                term_key = f"Sci2IdlX{mapping[i]}"
+                if (
+                    term_key in params and params[term_key] != 0.0
+                ):  # Export non-zero dynamic terms
+                    yaml_lines.append(
+                        f"  Sci2IdlX{mapping[i]}: {params[f'Sci2IdlX{mapping[i]}']:.8e}"
+                    )
+                    yaml_lines.append(
+                        f"  Sci2IdlY{mapping[i]}: {params[f'Sci2IdlY{mapping[i]}']:.8e}"
+                    )
+                    yaml_lines.append(
+                        f"  Idl2SciX{mapping[i]}: {params[f'Idl2SciX{mapping[i]}']:.8e}"
+                    )
+                    yaml_lines.append(
+                        f"  Idl2SciY{mapping[i]}: {params[f'Idl2SciY{mapping[i]}']:.8e}"
+                    )
 
     with open(output_filename, "w") as f:
         f.write("\n".join(yaml_lines) + "\n")
-
-    print(
-        f"[{os.path.basename(output_filename)}] Successfully exported {len(calibrated_siaf_params)} SCA updates."
-    )
     return output_filename
