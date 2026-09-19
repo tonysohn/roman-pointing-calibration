@@ -1,7 +1,7 @@
-import csv
 import glob
 import json
 import os
+import sys
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +16,30 @@ from skimage.transform import SimilarityTransform
 from tqdm import tqdm
 
 from .diagnostics import generate_alignment_diagnostics
+
+
+class TerminalLogger(object):
+    def __init__(self, log_dir="logs"):
+        os.makedirs(log_dir, exist_ok=True)
+        # Generates a stamp like: alignment_20260917_211516.log
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filepath = os.path.join(log_dir, f"alignment_{timestamp}.log")
+
+        self.terminal = sys.stdout
+        self.log_file = open(log_filepath, "a", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log_file.write(message)
+        self.log_file.flush()  # Forces write to disk immediately so crashes don't lose data
+
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
+
+
+# Override standard output globally
+sys.stdout = TerminalLogger()
 
 
 def fit_full_distortion(x_pix, y_pix, x_idl, y_idl, x_sci_ref, y_sci_ref, degree=4):
@@ -360,7 +384,6 @@ def align_wfi(
     phot_catalogs,
     ref_catalog,
     pointing_info,
-    user_offsets=None,
     max_iterations=5,
     debug=False,
     precomputed_matches_dir="roman_gaia_match",
@@ -372,18 +395,13 @@ def align_wfi(
 
     if roman_siaf is None:
         roman_siaf = pysiaf.Siaf("Roman")
-    user_offsets = user_offsets or {}
+
     cos_dec = np.cos(np.deg2rad(pointing_info["DEC_V1"]))
 
-    current_ra = pointing_info["RA_V1"] + (
-        (user_offsets.get("d_ra_arcsec", 0.0) / 3600.0) / cos_dec
-    )
-    current_dec = pointing_info["DEC_V1"] + (
-        user_offsets.get("d_dec_arcsec", 0.0) / 3600.0
-    )
-    current_pa = pointing_info["PA_V3"] + (
-        user_offsets.get("d_pa_arcsec", 0.0) / 3600.0
-    )
+    # Directly initialize from telemetry without manual offsets
+    current_ra = pointing_info["RA_V1"]
+    current_dec = pointing_info["DEC_V1"]
+    current_pa = pointing_info["PA_V3"]
 
     precomputed_matches = load_standalone_matches(precomputed_matches_dir)
     iteration_history = []
@@ -701,18 +719,25 @@ def align_wfi(
             ]
         )
 
-        for s in successfully_fitted_scas:
-            calibrated_siaf_params[s]["V2Ref"] -= mean_dv2
-            calibrated_siaf_params[s]["V3Ref"] -= mean_dv3
-            calibrated_siaf_params[s]["V3IdlYAngle"] -= mean_dtheta
+        # --- RIGID BODY ENSEMBLE UPDATE FOR WFI_CEN ---
+        # Update WFI_CEN as the master reference aperture tracking the bulk movement of the 18 SCAs
+        cen = roman_siaf["WFI_CEN"]
+        calibrated_siaf_params["WFI_CEN"] = {
+            "V2Ref": cen.V2Ref + mean_dv2,
+            "V3Ref": cen.V3Ref + mean_dv3,
+            "V3IdlYAngle": cen.V3IdlYAngle + mean_dtheta,
+        }
+        # ----------------------------------------------
+
+        # NOTE: We intentionally do NOT subtract the mean from the individual SCAs here.
+        # Each SCA retains its true absolute solved position so the exported YAML
+        # accurately captures the floating mosaic geometry.
 
         attitude_results["Residual_Mean_V2_mas"] = mean_dv2 * 1000.0
         attitude_results["Residual_Mean_V3_mas"] = mean_dv3 * 1000.0
         attitude_results["RA_V1"] += (mean_dv2 / 3600.0) / cos_dec
         attitude_results["DEC_V1"] += mean_dv3 / 3600.0
-        attitude_results["PA_V3"] += (
-            mean_dtheta / 3600.0
-        )  # Proper absolute mapping parity
+        attitude_results["PA_V3"] += mean_dtheta / 3600.0
 
     if target_wfi_cen is not None:
         bam_v2_cen = target_wfi_cen["V2"]
@@ -779,6 +804,7 @@ def align_wfi(
         iteration_history=iteration_history,
         output_dir="./diagnostics",
         calibrated_siaf_params=calibrated_siaf_params,
+        nominal_siaf=roman_siaf,
     )
 
     return calibrated_siaf_params, attitude_results, diagnostic_log

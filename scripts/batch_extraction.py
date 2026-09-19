@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+import argparse
 import glob
 import os
 
@@ -5,66 +7,78 @@ import numpy as np
 
 from roman_pointing import extract_wfi_sources
 
-# 1. Initialize the dictionary required by the pipeline
-phot_catalogs = {}
 
-# =========================================================================
-# CONFIGURATION
-# =========================================================================
-# Choose your extraction strategy: 'gaussian' (fast) or 'epsf' (high-fidelity)
-CENTROID_STRATEGY = "gaussian"
-# =========================================================================
-
-# 2. Locate all perturbed files in the directory
-input_files = glob.glob(
-    "/Users/tsohn/Roman/Commissioning/CAR-086/r0102801001001003001_0002_wfi??_f146_cal.asdf"
-)
-input_files.sort()
-
-print(f"Found {len(input_files)} perturbed files to process.\n")
-print(f"Using extraction strategy: '{CENTROID_STRATEGY}'\n")
-
-# 3. Loop through and extract sources
-for filepath in input_files:
-    basename = os.path.basename(filepath)
-
-    # Extract the SCA name from the filename for the output ECSV naming
-    parts = basename.upper().split("_")
-    sca_name = next(
-        (part for part in parts if part.startswith("WFI") and len(part) == 5), None
+def main():
+    parser = argparse.ArgumentParser(
+        description="Batch extract WFI sources from ASDF files."
     )
+    parser.add_argument(
+        "target_dir",
+        nargs="?",
+        default=".",
+        help="Target directory containing the ASDF files (defaults to current directory)",
+    )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default="gaussian",
+        choices=["gaussian", "epsf"],
+        help="Extraction strategy: 'gaussian' (fast) or 'epsf' (high-fidelity)",
+    )
+    args = parser.parse_args()
 
-    if sca_name:
-        dict_key = f"{sca_name}_FULL"
+    phot_catalogs = {}
 
-        # Run the source extraction tool with the selected strategy
-        catalog = extract_wfi_sources(
-            asdf_filepath=filepath,
-            centroid_method=CENTROID_STRATEGY,
-            save_diagnostic_plot=True,
-            plot_outdir="./",
+    # Locate all calibrated files dynamically in the target directory
+    search_pattern = os.path.join(args.target_dir, "*_cal.asdf")
+    input_files = sorted(glob.glob(search_pattern))
+
+    if not input_files:
+        print(f"No calibrated ASDF files found in '{args.target_dir}'.")
+        return
+
+    print(
+        f"Found {len(input_files)} calibrated files in '{args.target_dir}' to process."
+    )
+    print(f"Using extraction strategy: '{args.strategy}'\n")
+
+    for filepath in input_files:
+        basename = os.path.basename(filepath)
+
+        parts = basename.upper().split("_")
+        sca_name = next(
+            (part for part in parts if part.startswith("WFI") and len(part) == 5), None
         )
 
-        # Store the resulting Astropy Table in the dictionary
-        if len(catalog) > 0:
-            phot_catalogs[dict_key] = catalog
+        if sca_name:
+            dict_key = f"{sca_name}_FULL"
 
-            # --- FILE EXPORT FORMATTING ---
-            # Create a copy so we don't truncate the pipeline's internal 64-bit precision
-            fmt_catalog = catalog.copy()
+            catalog = extract_wfi_sources(
+                asdf_filepath=filepath,
+                centroid_method=args.strategy,
+                save_diagnostic_plot=True,
+                plot_outdir=args.target_dir,
+            )
 
-            # Truncate all floating point numbers to 4 decimal places
-            for col in fmt_catalog.colnames:
-                if fmt_catalog[col].dtype.kind in "fc":  # if float or complex
-                    fmt_catalog[col].format = "%.4f"
+            if len(catalog) > 0:
+                phot_catalogs[dict_key] = catalog
 
-            # Write with fixed-width formatting for perfect column alignment
-            out_filename = f"{basename}_catalog.ecsv"
-            fmt_catalog.write(out_filename, format="ascii.ecsv", overwrite=True)
-            print(f"  -> Exported formatted ECSV catalog: {out_filename}")
+                fmt_catalog = catalog.copy()
+                for col in fmt_catalog.colnames:
+                    if fmt_catalog[col].dtype.kind in "fc":
+                        fmt_catalog[col].format = "%.4f"
+
+                # Save output ECSV in the same directory as the target ASDFs
+                out_filename = os.path.join(args.target_dir, f"{basename}_catalog.ecsv")
+                fmt_catalog.write(out_filename, format="ascii.ecsv", overwrite=True)
+                print(f"  -> Exported formatted ECSV catalog: {out_filename}")
+            else:
+                print(f"Skipping {dict_key}: No valid sources extracted.")
         else:
-            print(f"Skipping {dict_key}: No valid sources extracted.")
-    else:
-        print(f"Could not parse SCA name from filename: {basename}")
+            print(f"Could not parse SCA name from filename: {basename}")
 
-print("\nBatch extraction complete.")
+    print("\nBatch extraction complete.")
+
+
+if __name__ == "__main__":
+    main()
