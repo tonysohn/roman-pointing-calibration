@@ -8,6 +8,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import pysiaf
 from astropy.table import Table
 from scipy.optimize import least_squares
@@ -42,10 +43,28 @@ class TerminalLogger(object):
 sys.stdout = TerminalLogger()
 
 
-def fit_full_distortion(x_pix, y_pix, x_idl, y_idl, x_sci_ref, y_sci_ref, degree=4):
-    """Fits an N-th order 2D polynomial from Science Pixels to Ideal Arcsec."""
-    dx = x_pix - x_sci_ref
-    dy = y_pix - y_sci_ref
+def get_3d_vector(v2_arcsec, v3_arcsec):
+    """Converts V2/V3 arcsec to a 3D Cartesian unit vector."""
+    v2_rad = np.deg2rad(v2_arcsec / 3600.0)
+    v3_rad = np.deg2rad(v3_arcsec / 3600.0)
+    v1 = np.cos(v3_rad) * np.cos(v2_rad)
+    v2 = np.cos(v3_rad) * np.sin(v2_rad)
+    v3 = np.sin(v3_rad)
+    return np.array([v1, v2, v3])
+
+
+def get_v2v3_from_3d(vec):
+    """Converts a 3D Cartesian unit vector back to V2/V3 arcsec."""
+    v2_rad = np.arctan2(vec[1], vec[0])
+    v3_rad = np.arcsin(vec[2])
+    return np.rad2deg(v2_rad) * 3600.0, np.rad2deg(v3_rad) * 3600.0
+
+
+def fit_full_distortion(x_pix, y_pix, x_idl, y_idl, x_sci_ref, y_sci_ref, degree=5):
+    """Fits an N-th order 2D polynomial from Science Pixels to Ideal Arcsec with numerical scaling."""
+    norm = 2048.0
+    dx = (x_pix - x_sci_ref) / norm
+    dy = (y_pix - y_sci_ref) / norm
 
     terms = []
     for d in range(degree + 1):
@@ -74,33 +93,55 @@ def fit_full_distortion(x_pix, y_pix, x_idl, y_idl, x_sci_ref, y_sci_ref, degree
             break
         valid = keep
 
-    # Final Fit
     cx, _, _, _ = np.linalg.lstsq(design_matrix[valid], x_idl[valid], rcond=None)
     cy, _, _, _ = np.linalg.lstsq(design_matrix[valid], y_idl[valid], rcond=None)
+
+    # Rescale coefficients back to physical pixel units
+    idx = 0
+    for d in range(degree + 1):
+        for y_deg in range(d + 1):
+            x_deg = d - y_deg
+            scale_factor = (norm**x_deg) * (norm**y_deg)
+            cx[idx] /= scale_factor
+            cy[idx] /= scale_factor
+            idx += 1
 
     return cx, cy, valid
 
 
 def fit_inverse_distortion(
-    x_idl, y_idl, x_pix, y_pix, x_sci_ref, y_sci_ref, valid_mask, degree=4
+    x_idl, y_idl, x_pix, y_pix, x_sci_ref, y_sci_ref, valid_mask, degree=5
 ):
-    """Fits the inverse mapping from Ideal Arcsec back to Science Pixels."""
+    """Fits the inverse mapping from Ideal Arcsec back to Science Pixels with numerical scaling."""
     dx = x_pix - x_sci_ref
     dy = y_pix - y_sci_ref
+
+    norm = 200.0
+    x_n = x_idl / norm
+    y_n = y_idl / norm
 
     terms = []
     for d in range(degree + 1):
         for y_deg in range(d + 1):
             x_deg = d - y_deg
-            terms.append((x_idl**x_deg) * (y_idl**y_deg))
+            terms.append((x_n**x_deg) * (y_n**y_deg))
 
     design_matrix = np.column_stack(terms)
     X_valid = design_matrix[valid_mask]
 
-    cx, _, _, _ = np.linalg.lstsq(X_valid, dx[valid_mask], rcond=None)
-    cy, _, _, _ = np.linalg.lstsq(X_valid, dy[valid_mask], rcond=None)
+    cx_inv, _, _, _ = np.linalg.lstsq(X_valid, dx[valid_mask], rcond=None)
+    cy_inv, _, _, _ = np.linalg.lstsq(X_valid, dy[valid_mask], rcond=None)
 
-    return cx, cy
+    idx = 0
+    for d in range(degree + 1):
+        for y_deg in range(d + 1):
+            x_deg = d - y_deg
+            scale_factor = (norm**x_deg) * (norm**y_deg)
+            cx_inv[idx] /= scale_factor
+            cy_inv[idx] /= scale_factor
+            idx += 1
+
+    return cx_inv, cy_inv
 
 
 def load_standalone_matches_as_seed(output_dir="roman_gaia_match"):
@@ -405,12 +446,12 @@ def align_wfi(
 
     precomputed_matches = load_standalone_matches(precomputed_matches_dir)
     iteration_history = []
-    pbar = tqdm(range(max_iterations), desc="Solving Global Attitude")
 
+    print("\nSolving Global Attitude...")
     # -------------------------------------------------------------------------
     # ITERATIVE GLOBAL ATTITUDE SOLVER
     # -------------------------------------------------------------------------
-    for i in pbar:
+    for i in range(max_iterations):
         att_matrix = pysiaf.utils.rotations.attitude(
             0, 0, current_ra, current_dec, current_pa
         )
@@ -491,7 +532,13 @@ def align_wfi(
 
         step_mag_arcsec = np.sqrt(d_ra**2 + d_dec**2)
         iteration_history.append(step_mag_arcsec)
-        pbar.set_postfix({"Res_Mag_arcsec": f"{step_mag_arcsec:.3f}"})
+
+        progress = int((i + 1) / max_iterations * 100)
+        bar_str = "█" * int(progress / 2) + " " * (50 - int(progress / 2))
+        print(
+            f"  {progress:3d}%|{bar_str}| {i + 1}/{max_iterations} [Res_Mag_arcsec={step_mag_arcsec:.3f}]"
+        )
+
         if np.sqrt(d_ra**2 + d_dec**2 + d_pa**2) < 0.001:
             break
 
@@ -575,11 +622,11 @@ def align_wfi(
             }
             poly_coeffs = aper.get_polynomial_coefficients()
 
-            if fit_degree == 4:
+            if fit_degree == 5:
                 # Extract target Ideal coordinates using the newly locked frame
                 x_idl_ref, y_idl_ref = aper.tel_to_idl(v2_ref_fit, v3_ref_fit)
 
-                # Fit using ALL available matched stars (removed train/test split)
+                # Fit 5th order polynomials
                 cx, cy, valid_mask = fit_full_distortion(
                     x_obs_1based,
                     y_obs_1based,
@@ -587,7 +634,7 @@ def align_wfi(
                     y_idl_ref,
                     aper.XSciRef,
                     aper.YSciRef,
-                    degree=4,
+                    degree=5,
                 )
                 cx_inv, cy_inv = fit_inverse_distortion(
                     x_idl_ref,
@@ -597,16 +644,21 @@ def align_wfi(
                     aper.XSciRef,
                     aper.YSciRef,
                     valid_mask,
-                    degree=4,
+                    degree=5,
                 )
 
-                # Wipe and Replace PySIAF Distortion Maps
-                num_fitted_terms = len(cx)
+                num_fitted_terms = len(cx)  # Will be 21 for degree 5
                 for i in range(num_fitted_terms):
-                    poly_coeffs["Sci2IdlX"][i] = cx[i]
-                    poly_coeffs["Sci2IdlY"][i] = cy[i]
-                    poly_coeffs["Idl2SciX"][i] = cx_inv[i]
-                    poly_coeffs["Idl2SciY"][i] = cy_inv[i]
+                    if i == 0:  # Force affine zero-points strictly to 0.0
+                        poly_coeffs["Sci2IdlX"][i] = 0.0
+                        poly_coeffs["Sci2IdlY"][i] = 0.0
+                        poly_coeffs["Idl2SciX"][i] = 0.0
+                        poly_coeffs["Idl2SciY"][i] = 0.0
+                    else:
+                        poly_coeffs["Sci2IdlX"][i] = cx[i]
+                        poly_coeffs["Sci2IdlY"][i] = cy[i]
+                        poly_coeffs["Idl2SciX"][i] = cx_inv[i]
+                        poly_coeffs["Idl2SciY"][i] = cy_inv[i]
 
                 for i in range(num_fitted_terms, len(poly_coeffs["Sci2IdlX"])):
                     poly_coeffs["Sci2IdlX"][i] = 0.0
@@ -643,9 +695,11 @@ def align_wfi(
 
             mapping = {}
             idx = 0
-            for d in range(6):
+
+            # Dynamically bound the loop instead of hardcoding 6
+            for d in range(fit_degree + 1):
                 for y_deg in range(d + 1):
-                    mapping[idx] = f"{d - y_deg}{y_deg}"
+                    mapping[idx] = f"{d}{y_deg}"
                     idx += 1
 
             for i in range(len(poly_coeffs["Sci2IdlX"])):
@@ -749,6 +803,7 @@ def align_wfi(
             roman_siaf["WFI_CEN"].V3Ref,
             roman_siaf["WFI_CEN"].V3IdlYAngle,
         )
+
         dtheta_rad = np.deg2rad(bam_angle_cen - nom_angle_cen)
         cos_t, sin_t = np.cos(dtheta_rad), np.sin(dtheta_rad)
 
@@ -757,11 +812,12 @@ def align_wfi(
                 calibrated_siaf_params[sca]["V2Ref"] - nom_v2_cen,
                 calibrated_siaf_params[sca]["V3Ref"] - nom_v3_cen,
             )
+            # Corrected V2/V3 Counter-Clockwise Rotation Matrix
             calibrated_siaf_params[sca]["V2Ref"] = bam_v2_cen + (
-                dx * cos_t - dy * sin_t
+                dx * cos_t + dy * sin_t
             )
             calibrated_siaf_params[sca]["V3Ref"] = bam_v3_cen + (
-                dx * sin_t + dy * cos_t
+                -dx * sin_t + dy * cos_t
             )
             calibrated_siaf_params[sca]["V3IdlYAngle"] += bam_angle_cen - nom_angle_cen
 
@@ -807,6 +863,50 @@ def align_wfi(
         nominal_siaf=roman_siaf,
     )
 
+    # -------------------------------------------------------------------------
+    # SPHERICAL GEOMETRY UPDATE FOR CGI_CEN
+    # -------------------------------------------------------------------------
+    # CAUTION: We are explicitly loading the PRD preflight SIAF here as the
+    # baseline rather than relying on the `roman_siaf` function argument.
+    # This ensures CGI_CEN is transformed against the pristine preflight
+    # hardware geometry before applying the newly calibrated WFI_CEN shift.
+
+    prd_siaf = pysiaf.Siaf("Roman")
+
+    if "CGI_CEN" in prd_siaf.apertures:
+        cgi_old = prd_siaf["CGI_CEN"]
+        wfi_old = prd_siaf["WFI_CEN"]
+
+        v2_wfi_old, v3_wfi_old = wfi_old.V2Ref, wfi_old.V3Ref
+        v2_wfi_new, v3_wfi_new = (
+            calibrated_siaf_params["WFI_CEN"]["V2Ref"],
+            calibrated_siaf_params["WFI_CEN"]["V3Ref"],
+        )
+        dtheta_deg = (
+            calibrated_siaf_params["WFI_CEN"]["V3IdlYAngle"] - wfi_old.V3IdlYAngle
+        )
+
+        # M_old maps Body to Local Sky. M_new maps Calibrated Body to the same Local Sky.
+        M_old = pysiaf.utils.rotations.attitude(v2_wfi_old, v3_wfi_old, 0.0, 0.0, 0.0)
+        M_new = pysiaf.utils.rotations.attitude(
+            v2_wfi_new, v3_wfi_new, 0.0, 0.0, dtheta_deg
+        )
+
+        cgi_vec_old = get_3d_vector(cgi_old.V2Ref, cgi_old.V3Ref)
+
+        # Body-to-Sky transform, then Sky-to-Body transform
+        cgi_vec_sky = np.dot(M_old, cgi_vec_old)
+        cgi_vec_new = np.dot(M_new.T, cgi_vec_sky)
+
+        v2_cgi_new, v3_cgi_new = get_v2v3_from_3d(cgi_vec_new)
+        angle_cgi_new = cgi_old.V3IdlYAngle + dtheta_deg
+
+        calibrated_siaf_params["CGI_CEN"] = {
+            "V2Ref": v2_cgi_new,
+            "V3Ref": v3_cgi_new,
+            "V3IdlYAngle": angle_cgi_new,
+        }
+
     return calibrated_siaf_params, attitude_results, diagnostic_log
 
 
@@ -817,7 +917,9 @@ def export_alignment_to_yaml(calibrated_siaf_params, output_prefix="roman_wfi_up
 
     mapping = {}
     idx = 0
-    for d in range(6):
+
+    # Dynamically bound the loop instead of hardcoding 6
+    for d in range(fit_degree + 1):
         for y_deg in range(d + 1):
             mapping[idx] = f"{d - y_deg}{y_deg}"
             idx += 1

@@ -80,21 +80,37 @@ def calibrate_roman_fgs_alignment(
     # Rotate ECI vectors into the Body Frame
     u_body_ref = (m_ECI_to_B @ u_eci_apparent.T).T
 
-    # --- 2. MEASURED VECTORS (Measured FGS in Body Frame) ---
-    x_wc, y_wc = wfi_cen_aper.tel_to_idl(measured_v2_v3[:, 0], measured_v2_v3[:, 1])
+    # --- 2. MEASURED VECTORS (Direct Body Frame) ---
+    # Convert V2/V3 directly into 3D Cartesian Body vectors.
+    # By staying in the right-handed Body frame, we avoid the left-handed
+    # reflection that caused the roll solver to invert.
+    v2_rad = np.deg2rad(measured_v2_v3[:, 0] / 3600.0)
+    v3_rad = np.deg2rad(measured_v2_v3[:, 1] / 3600.0)
 
-    # FGS-specific axis flip from WFI_CEN
-    x_fgs_ang = x_wc
-    y_fgs_ang = -y_wc
+    u_body_meas = np.stack(
+        [
+            np.cos(v3_rad) * np.cos(v2_rad),
+            np.cos(v3_rad) * np.sin(v2_rad),
+            np.sin(v3_rad),
+        ],
+        axis=1,
+    )
 
-    x_rad = np.deg2rad(x_fgs_ang / 3600.0)
-    y_rad = np.deg2rad(y_fgs_ang / 3600.0)
-
-    u_fgs_meas = np.stack([np.tan(x_rad), np.tan(y_rad), np.ones_like(x_rad)], axis=1)
-    u_fgs_meas /= np.linalg.norm(u_fgs_meas, axis=1, keepdims=True)
-
-    # Rotate measured FGS vectors into the Body Frame
-    u_body_meas = (m_FGS_to_B_old @ u_fgs_meas.T).T
+    ###    # --- 2. MEASURED VECTORS (Measured FGS in Body Frame) ---
+    ###    x_wc, y_wc = wfi_cen_aper.tel_to_idl(measured_v2_v3[:, 0], measured_v2_v3[:, 1])
+    ###
+    ###    # FGS-specific axis flip from WFI_CEN
+    ###    x_fgs_ang = x_wc
+    ###    y_fgs_ang = -y_wc
+    ###
+    ###    x_rad = np.deg2rad(x_fgs_ang / 3600.0)
+    ###    y_rad = np.deg2rad(y_fgs_ang / 3600.0)
+    ###
+    ###    u_fgs_meas = np.stack([np.tan(x_rad), np.tan(y_rad), np.ones_like(x_rad)], axis=1)
+    ###    u_fgs_meas /= np.linalg.norm(u_fgs_meas, axis=1, keepdims=True)
+    ###
+    ###    # Rotate measured FGS vectors into the Body Frame
+    ###    u_body_meas = (m_FGS_to_B_old @ u_fgs_meas.T).T
 
     # --- 3. SOLVE DELTA CORRECTION ---
     # R.align_vectors(A, B) finds rotation R such that R * B = A
@@ -102,7 +118,7 @@ def calibrate_roman_fgs_alignment(
     wahba_res = R.align_vectors(u_body_ref, u_body_meas)
     delta_R = wahba_res[0].as_matrix()
 
-    print(f"Wahba Solver Internal Delta: {np.rad2deg(wahba_res[1]) * 3600:.4f} arcsec")
+    # rint(f"Wahba Solver Internal Delta: {np.rad2deg(wahba_res[1]) * 3600:.4f} arcsec")
 
     # --- 4. UPDATE ALIGNMENT MATRIX & CONVERT TO QUATERNION ---
     # M_{FGS -> Body_new} = Delta_R * M_{FGS -> Body_old}
