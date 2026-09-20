@@ -681,6 +681,51 @@ def main():
         "V3IdlYAngle": bam_angle,
     }
 
+    # --- SPHERICAL GEOMETRY UPDATE FOR CGI_CEN ---
+    # Due to CGI's large offset from the WFI center, we use 3D spherical rotation
+    # anchored against the pristine pre-flight baseline.
+    if "CGI_CEN" in pristine_siaf.apertures:
+        cgi_old = pristine_siaf["CGI_CEN"]
+        wfi_old = pristine_siaf["WFI_CEN"]
+
+        v2_wfi_old, v3_wfi_old = wfi_old.V2Ref, wfi_old.V3Ref
+        v2_wfi_new, v3_wfi_new = bam_v2, bam_v3
+
+        # Construct local sky rotation matrices
+        M_old = pysiaf.utils.rotations.attitude(v2_wfi_old, v3_wfi_old, 0.0, 0.0, 0.0)
+        M_new = pysiaf.utils.rotations.attitude(
+            v2_wfi_new, v3_wfi_new, 0.0, 0.0, dAngle_bulk
+        )
+
+        # Convert CGI old V2/V3 to 3D Cartesian vector
+        c2_rad = np.deg2rad(cgi_old.V2Ref / 3600.0)
+        c3_rad = np.deg2rad(cgi_old.V3Ref / 3600.0)
+        cgi_vec_old = np.array(
+            [
+                np.cos(c3_rad) * np.cos(c2_rad),
+                np.cos(c3_rad) * np.sin(c2_rad),
+                np.sin(c3_rad),
+            ]
+        )
+
+        # Body-to-Sky transform, then Sky-to-Body transform with the new BAM center
+        cgi_vec_sky = np.dot(M_old, cgi_vec_old)
+        cgi_vec_new = np.dot(M_new.T, cgi_vec_sky)
+
+        # Convert back to V2/V3 arcsec
+        v2_cgi_new = np.rad2deg(np.arctan2(cgi_vec_new[1], cgi_vec_new[0])) * 3600.0
+        v3_cgi_new = np.rad2deg(np.arcsin(cgi_vec_new[2])) * 3600.0
+        angle_cgi_new = cgi_old.V3IdlYAngle + dAngle_bulk
+
+        calibrated_siaf_params["CGI_CEN"] = {
+            "V2Ref": v2_cgi_new,
+            "V3Ref": v3_cgi_new,
+            "V3IdlYAngle": angle_cgi_new,
+        }
+        print(
+            f"Updated CGI_CEN -> V2Ref: {v2_cgi_new:.3f}, V3Ref: {v3_cgi_new:.3f}, Angle: {angle_cgi_new:.5f}"
+        )
+
     # Export to SIAF YAML
     output_yaml = export_custom_siaf_yaml(
         calibrated_siaf_params=calibrated_siaf_params,
