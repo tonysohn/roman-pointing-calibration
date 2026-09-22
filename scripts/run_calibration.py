@@ -66,65 +66,6 @@ CUSTOM_SIAF_PATH = None  # Use this only when testing. Otherwise, start from PRD
 # =========================================================================
 
 
-def load_standalone_matches(output_dir=CROSSMATCH_DIR):
-    import glob
-    import os
-
-    import numpy as np
-    from astropy.modeling import fitting, models
-    from astropy.table import Table
-
-    matched_data = {}
-    ecsv_files = glob.glob(f"{output_dir}/*_xmatch.ecsv") + glob.glob(
-        f"{output_dir}/*_matches.ecsv"
-    )
-
-    if not ecsv_files:
-        print(f"No matched catalogs found in '{output_dir}'!")
-        return None
-
-    for f in ecsv_files:
-        basename = os.path.basename(f)
-        parts = basename.upper().split("_")
-        det = next(
-            (part for part in parts if part.startswith("WFI") and len(part) == 5), None
-        )
-        if not det:
-            continue
-
-        sca_key = f"{det}_FULL" if not det.endswith("_FULL") else det
-        t = Table.read(f, format="ascii.ecsv")
-
-        init_model = models.Polynomial2D(degree=2)
-        fitter = fitting.LinearLSQFitter()
-
-        m_ra = fitter(init_model, t["x"], t["y"], t["ra_epoch"])
-        m_dec = fitter(init_model, t["x"], t["y"], t["dec_epoch"])
-
-        d_ra = t["ra_epoch"] - m_ra(t["x"], t["y"])
-        d_dec = t["dec_epoch"] - m_dec(t["x"], t["y"])
-
-        scatter_arcsec = np.hypot(d_ra, d_dec) * 3600.0
-
-        keep = scatter_arcsec < 5.0
-        t = t[keep]
-
-        matched_data[sca_key] = {
-            "x_obs": np.array(t["x"]),
-            "y_obs": np.array(t["y"]),
-            "ra_cat": np.array(t["ra_epoch"]),
-            "dec_cat": np.array(t["dec_epoch"]),
-            "mag_cat": np.array(t["phot_g_mean_mag"])
-            if "phot_g_mean_mag" in t.colnames
-            else np.full(len(t), 99.0),
-        }
-
-    print(
-        f"Loaded and filtered perfect 1-to-1 matches for {len(matched_data)} SCAs from '{output_dir}'."
-    )
-    return matched_data
-
-
 def export_custom_siaf_yaml(
     calibrated_siaf_params,
     roman_siaf,
@@ -390,8 +331,6 @@ def main():
         return
 
     print("\n--- 2. RUNNING WFI ALIGNMENT ---")
-
-    roman_pointing.alignment.load_standalone_matches = load_standalone_matches
 
     calibrated_siaf_params, attitude_results, matched_pairs_log = align_wfi(
         phot_catalogs=phot_catalogs,

@@ -14,7 +14,6 @@ from astropy.table import Table
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from skimage.transform import SimilarityTransform
-from tqdm import tqdm
 
 from .diagnostics import generate_alignment_diagnostics
 
@@ -22,7 +21,6 @@ from .diagnostics import generate_alignment_diagnostics
 class TerminalLogger(object):
     def __init__(self, log_dir="logs"):
         os.makedirs(log_dir, exist_ok=True)
-        # Generates a stamp like: alignment_20260917_211516.log
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_filepath = os.path.join(log_dir, f"alignment_{timestamp}.log")
 
@@ -32,14 +30,13 @@ class TerminalLogger(object):
     def write(self, message):
         self.terminal.write(message)
         self.log_file.write(message)
-        self.log_file.flush()  # Forces write to disk immediately so crashes don't lose data
+        self.log_file.flush()
 
     def flush(self):
         self.terminal.flush()
         self.log_file.flush()
 
 
-# Override standard output globally
 sys.stdout = TerminalLogger()
 
 
@@ -96,7 +93,6 @@ def fit_full_distortion(x_pix, y_pix, x_idl, y_idl, x_sci_ref, y_sci_ref, degree
     cx, _, _, _ = np.linalg.lstsq(design_matrix[valid], x_idl[valid], rcond=None)
     cy, _, _, _ = np.linalg.lstsq(design_matrix[valid], y_idl[valid], rcond=None)
 
-    # Rescale coefficients back to physical pixel units
     idx = 0
     for d in range(degree + 1):
         for y_deg in range(d + 1):
@@ -144,7 +140,7 @@ def fit_inverse_distortion(
     return cx_inv, cy_inv
 
 
-def load_standalone_matches_as_seed(output_dir="roman_gaia_match"):
+def load_standalone_matches_as_seed(output_dir="crossmatch_results"):
     out_path = Path(output_dir)
     summary_files = list(out_path.glob("*_summary.json"))
     if not summary_files:
@@ -163,16 +159,27 @@ def load_standalone_matches_as_seed(output_dir="roman_gaia_match"):
     return precomputed_seeds
 
 
-def load_standalone_matches(output_dir="roman_gaia_match"):
+def load_standalone_matches(output_dir="crossmatch_results"):
+    """Natively loads precomputed matches from either pipeline."""
     matched_data = {}
-    ecsv_files = glob.glob(f"{output_dir}/*_matches.ecsv")
+    ecsv_files = glob.glob(f"{output_dir}/*_xmatch.ecsv") + glob.glob(
+        f"{output_dir}/*_matches.ecsv"
+    )
     if not ecsv_files:
         return None
 
     for f in ecsv_files:
-        det = os.path.basename(f).split("_")[0]
+        basename = os.path.basename(f)
+        parts = basename.upper().split("_")
+        det = next(
+            (part for part in parts if part.startswith("WFI") and len(part) == 5), None
+        )
+        if not det:
+            continue
+
         sca_key = f"{det}_FULL" if not det.endswith("_FULL") else det
         t = Table.read(f, format="ascii.ecsv")
+
         matched_data[sca_key] = {
             "x_obs": np.array(t["x"]),
             "y_obs": np.array(t["y"]),
@@ -427,10 +434,10 @@ def align_wfi(
     pointing_info,
     max_iterations=5,
     debug=False,
-    precomputed_matches_dir="roman_gaia_match",
+    precomputed_matches_dir="crossmatch_results",
     target_wfi_cen=None,
     roman_siaf=None,
-    fit_degree=4,  # Default to Full Polynomial
+    fit_degree=4,
 ):
     warnings.filterwarnings("ignore", message=".*Gaia archive is in evolution.*")
 
@@ -439,7 +446,6 @@ def align_wfi(
 
     cos_dec = np.cos(np.deg2rad(pointing_info["DEC_V1"]))
 
-    # Directly initialize from telemetry without manual offsets
     current_ra = pointing_info["RA_V1"]
     current_dec = pointing_info["DEC_V1"]
     current_pa = pointing_info["PA_V3"]
@@ -448,9 +454,6 @@ def align_wfi(
     iteration_history = []
 
     print("\nSolving Global Attitude...")
-    # -------------------------------------------------------------------------
-    # ITERATIVE GLOBAL ATTITUDE SOLVER
-    # -------------------------------------------------------------------------
     for i in range(max_iterations):
         att_matrix = pysiaf.utils.rotations.attitude(
             0, 0, current_ra, current_dec, current_pa
@@ -463,7 +466,6 @@ def align_wfi(
             if not aper:
                 continue
 
-            # --- DIRECT INJECTION OF EXACT MATCHES ---
             if precomputed_matches and aper_name in precomputed_matches:
                 x_obs_1based = precomputed_matches[aper_name]["x_obs"]
                 y_obs_1based = precomputed_matches[aper_name]["y_obs"]
@@ -477,7 +479,6 @@ def align_wfi(
                 global_dec_ref.extend(precomputed_matches[aper_name]["dec_cat"])
 
             else:
-                # Fallback to KD-tree guessing
                 v2_obs, v3_obs = aper.sci_to_tel(catalog["x"] + 1, catalog["y"] + 1)
                 flux_obs = catalog["flux"] if "flux" in catalog.colnames else None
                 tol = 300.0 if i == 0 else 20.0 if i == 1 else 10.0
@@ -545,6 +546,24 @@ def align_wfi(
     diag_dir = "diagnostics"
     os.makedirs(diag_dir, exist_ok=True)
 
+    plt.figure(figsize=(8, 5))
+    plt.plot(
+        range(1, len(iteration_history) + 1),
+        iteration_history,
+        marker="o",
+        linestyle="-",
+        color="b",
+    )
+    plt.yscale("log")
+    plt.xlabel("Iteration")
+    plt.ylabel("Attitude Step Magnitude (arcsec)")
+    plt.title("Global Attitude Convergence")
+    plt.grid(True, which="both", ls="--")
+    plt.tight_layout()
+    plt.savefig(os.path.join(diag_dir, "attitude_convergence.png"), dpi=150)
+    plt.close()
+    print("  -> Saved attitude_convergence.png to diagnostics/")
+
     J = global_result.jac
     cov_global = np.linalg.inv(J.T @ J)
     MSE_global = (global_result.fun**2).mean()
@@ -554,9 +573,6 @@ def align_wfi(
         0, 0, current_ra, current_dec, current_pa
     )
 
-    # -------------------------------------------------------------------------
-    # LOCAL SCA FITTING & DIAGNOSTIC LOGGING
-    # -------------------------------------------------------------------------
     calibrated_siaf_params = {}
     summary_log_data = []
     matched_pairs_log_data = []
@@ -607,7 +623,6 @@ def align_wfi(
                 }
                 continue
 
-            # Lock the local reference frame origins using the affine fit
             dv2, dv3, d_theta, scale_x, scale_y, skew, sca_rms = _fit_sca_alignment(
                 v2_obs, v3_obs, v2_ref_fit, v3_ref_fit, aper.V2Ref, aper.V3Ref
             )
@@ -623,10 +638,8 @@ def align_wfi(
             poly_coeffs = aper.get_polynomial_coefficients()
 
             if fit_degree == 5:
-                # Extract target Ideal coordinates using the newly locked frame
                 x_idl_ref, y_idl_ref = aper.tel_to_idl(v2_ref_fit, v3_ref_fit)
 
-                # Fit 5th order polynomials
                 cx, cy, valid_mask = fit_full_distortion(
                     x_obs_1based,
                     y_obs_1based,
@@ -647,9 +660,9 @@ def align_wfi(
                     degree=5,
                 )
 
-                num_fitted_terms = len(cx)  # Will be 21 for degree 5
+                num_fitted_terms = len(cx)
                 for i in range(num_fitted_terms):
-                    if i == 0:  # Force affine zero-points strictly to 0.0
+                    if i == 0:
                         poly_coeffs["Sci2IdlX"][i] = 0.0
                         poly_coeffs["Sci2IdlY"][i] = 0.0
                         poly_coeffs["Idl2SciX"][i] = 0.0
@@ -667,7 +680,7 @@ def align_wfi(
                     poly_coeffs["Idl2SciY"][i] = 0.0
 
             elif fit_degree == 1:
-                # Standard Affine Mode (Scale & Skew updates)
+                valid_mask = np.ones(len(x_obs_1based), dtype=bool)
                 scale_error = max(abs(scale_x - 1.0), abs(scale_y - 1.0))
                 skew_error = abs(skew)
 
@@ -689,14 +702,13 @@ def align_wfi(
                     poly_coeffs["Idl2SciY"][1] = M_inverse[1, 0]
                     poly_coeffs["Idl2SciY"][2] = M_inverse[1, 1]
 
-            # Update Aperture and store populated terms for YAML Export
             lower_poly_coeffs = {k.lower(): v for k, v in poly_coeffs.items()}
             aper.set_polynomial_coefficients(**lower_poly_coeffs)
 
             mapping = {}
             idx = 0
 
-            # Dynamically bound the loop instead of hardcoding 6
+            # --- CRITICAL FIX RESTORED: Map natively to PySIAF's "{TotalDegree}{Y_Degree}" format ---
             for d in range(fit_degree + 1):
                 for y_deg in range(d + 1):
                     mapping[idx] = f"{d}{y_deg}"
@@ -717,8 +729,6 @@ def align_wfi(
                     "Idl2SciY"
                 ][i]
 
-            # --- CALCULATE TRUE RESIDUALS IMMEDIATELY (VECTORIZED) ---
-            # Evaluate final pre-shift coordinates for accurate physical residual math
             v2_cal_final, v3_cal_final = aper.sci_to_tel(
                 log_x_fit + 1.0, log_y_fit + 1.0
             )
@@ -726,6 +736,9 @@ def align_wfi(
             res_v3_mas = (v3_cal_final - v3_ref_fit) * 1000.0
 
             for j in range(num_matched):
+                if not valid_mask[j]:
+                    continue
+
                 matched_pairs_log_data.append(
                     [
                         aper_name,
@@ -773,19 +786,12 @@ def align_wfi(
             ]
         )
 
-        # --- RIGID BODY ENSEMBLE UPDATE FOR WFI_CEN ---
-        # Update WFI_CEN as the master reference aperture tracking the bulk movement of the 18 SCAs
         cen = roman_siaf["WFI_CEN"]
         calibrated_siaf_params["WFI_CEN"] = {
             "V2Ref": cen.V2Ref + mean_dv2,
             "V3Ref": cen.V3Ref + mean_dv3,
             "V3IdlYAngle": cen.V3IdlYAngle + mean_dtheta,
         }
-        # ----------------------------------------------
-
-        # NOTE: We intentionally do NOT subtract the mean from the individual SCAs here.
-        # Each SCA retains its true absolute solved position so the exported YAML
-        # accurately captures the floating mosaic geometry.
 
         attitude_results["Residual_Mean_V2_mas"] = mean_dv2 * 1000.0
         attitude_results["Residual_Mean_V3_mas"] = mean_dv3 * 1000.0
@@ -812,7 +818,6 @@ def align_wfi(
                 calibrated_siaf_params[sca]["V2Ref"] - nom_v2_cen,
                 calibrated_siaf_params[sca]["V3Ref"] - nom_v3_cen,
             )
-            # Corrected V2/V3 Counter-Clockwise Rotation Matrix
             calibrated_siaf_params[sca]["V2Ref"] = bam_v2_cen + (
                 dx * cos_t + dy * sin_t
             )
@@ -827,7 +832,6 @@ def align_wfi(
             "V3IdlYAngle": bam_angle_cen,
         }
 
-    # Vectorized post-calibration logging & diagnostic evaluation
     diagnostic_log = []
     rows_by_sca = {}
     for row in matched_pairs_log_data:
@@ -849,10 +853,8 @@ def align_wfi(
 
         for i, r in enumerate(rows):
             new_row = list(r)
-            # Update ONLY the plotting coordinates (indices 7 and 8) so they track with WFI_CEN
             new_row[7] = round(float(final_v2[i]), 4)
             new_row[8] = round(float(final_v3[i]), 4)
-            # Do NOT recalculate residuals here; the true physics were already locked above!
             diagnostic_log.append(new_row)
 
     generate_alignment_diagnostics(
@@ -862,14 +864,6 @@ def align_wfi(
         calibrated_siaf_params=calibrated_siaf_params,
         nominal_siaf=roman_siaf,
     )
-
-    # -------------------------------------------------------------------------
-    # SPHERICAL GEOMETRY UPDATE FOR CGI_CEN
-    # -------------------------------------------------------------------------
-    # CAUTION: We are explicitly loading the PRD preflight SIAF here as the
-    # baseline rather than relying on the `roman_siaf` function argument.
-    # This ensures CGI_CEN is transformed against the pristine preflight
-    # hardware geometry before applying the newly calibrated WFI_CEN shift.
 
     prd_siaf = pysiaf.Siaf("Roman")
 
@@ -886,7 +880,6 @@ def align_wfi(
             calibrated_siaf_params["WFI_CEN"]["V3IdlYAngle"] - wfi_old.V3IdlYAngle
         )
 
-        # M_old maps Body to Local Sky. M_new maps Calibrated Body to the same Local Sky.
         M_old = pysiaf.utils.rotations.attitude(v2_wfi_old, v3_wfi_old, 0.0, 0.0, 0.0)
         M_new = pysiaf.utils.rotations.attitude(
             v2_wfi_new, v3_wfi_new, 0.0, 0.0, dtheta_deg
@@ -894,7 +887,6 @@ def align_wfi(
 
         cgi_vec_old = get_3d_vector(cgi_old.V2Ref, cgi_old.V3Ref)
 
-        # Body-to-Sky transform, then Sky-to-Body transform
         cgi_vec_sky = np.dot(M_old, cgi_vec_old)
         cgi_vec_new = np.dot(M_new.T, cgi_vec_sky)
 
@@ -910,7 +902,9 @@ def align_wfi(
     return calibrated_siaf_params, attitude_results, diagnostic_log
 
 
-def export_alignment_to_yaml(calibrated_siaf_params, output_prefix="roman_wfi_updates"):
+def export_alignment_to_yaml(
+    calibrated_siaf_params, output_prefix="roman_wfi_updates", fit_degree=5
+):
     current_date = datetime.now().strftime("%Y%m%d")
     output_filename = f"{output_prefix}_{current_date}.yml"
     yaml_lines = [f"version: '{current_date}'"]
@@ -918,10 +912,10 @@ def export_alignment_to_yaml(calibrated_siaf_params, output_prefix="roman_wfi_up
     mapping = {}
     idx = 0
 
-    # Dynamically bound the loop instead of hardcoding 6
+    # --- CRITICAL FIX RESTORED: Map natively to PySIAF's "{TotalDegree}{Y_Degree}" format ---
     for d in range(fit_degree + 1):
         for y_deg in range(d + 1):
-            mapping[idx] = f"{d - y_deg}{y_deg}"
+            mapping[idx] = f"{d}{y_deg}"
             idx += 1
 
     for sca_name in sorted(calibrated_siaf_params.keys()):
@@ -935,9 +929,7 @@ def export_alignment_to_yaml(calibrated_siaf_params, output_prefix="roman_wfi_up
         if "Sci2IdlX10" in params:
             for i in range(21):
                 term_key = f"Sci2IdlX{mapping[i]}"
-                if (
-                    term_key in params and params[term_key] != 0.0
-                ):  # Export non-zero dynamic terms
+                if term_key in params and params[term_key] != 0.0:
                     yaml_lines.append(
                         f"  Sci2IdlX{mapping[i]}: {params[f'Sci2IdlX{mapping[i]}']:.8e}"
                     )
