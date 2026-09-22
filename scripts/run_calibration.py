@@ -277,7 +277,7 @@ def main():
     )
 
     try:
-        cat_file = "gaia_dr3_commissioning_field_wide.ecsv"
+        cat_file = "local_gaia_catalog.ecsv"
         print(f"  -> Loading reference catalog: {cat_file}")
         ref_catalog = Table.read(cat_file, format="ascii.ecsv")
 
