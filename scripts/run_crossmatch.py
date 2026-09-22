@@ -5,6 +5,11 @@ import dataclasses
 import glob
 import os
 
+import matplotlib
+
+matplotlib.use("Agg")
+import asdf
+import matplotlib.pyplot as plt
 import numpy as np
 from astropy.table import Table
 
@@ -12,8 +17,7 @@ from roman_pointing.crossmatch import (
     RobustMatchConfig,
     apply_affine_transformation,
     find_detector_consensus_matches,
-    project_reference_catalog_to_detector,
-    project_with_calibrated_siaf,
+    project_catalog,
 )
 
 
@@ -23,7 +27,7 @@ def process_single_detector(
     output_dir,
     config,
     global_seed,
-    yaml_file=None,
+    siaf_file=None,
     dV2=0.0,
     dV3=0.0,
 ):
@@ -31,7 +35,6 @@ def process_single_detector(
     basename = os.path.basename(asdf_path)
     base_prefix = basename.replace("_cal.asdf", "")
 
-    # Use base_prefix to avoid duplicating the suffix
     catalog_path = f"{base_prefix}_cal.asdf_catalog.ecsv"
     if not os.path.exists(catalog_path):
         return None, 0, None, f"Missing {catalog_path}"
@@ -45,6 +48,10 @@ def process_single_detector(
     if "flux" in obs_cat.colnames:
         obs_cat.sort("flux", reverse=True)
 
+    max_stars = 10000
+    if len(obs_cat) > max_stars:
+        obs_cat = obs_cat[:max_stars]
+
     obs_pixels = np.column_stack(
         [
             obs_cat["x"] + 1 if "x" in obs_cat.colnames else obs_cat["x_centroid"] + 1,
@@ -52,17 +59,16 @@ def process_single_detector(
         ]
     )
     try:
-        if yaml_file:
-            sub_cat, pred_pixels = project_with_calibrated_siaf(
-                asdf_path, ref_catalog, yaml_file, config, dV2, dV3
-            )
-        else:
-            sub_cat, pred_pixels = project_reference_catalog_to_detector(
-                asdf_path, ref_catalog, config
-            )
+        # Unified PySIAF projection supporting XML and YAML
+        sub_cat, pred_pixels = project_catalog(
+            asdf_path,
+            ref_catalog,
+            config,
+            custom_siaf_filepath=siaf_file,
+            dV2=dV2,
+            dV3=dV3,
+        )
 
-        # 2. SEEDED MATCH: Shrink the search window to 400 pixels around the global seed.
-        # This isolates the true peak from background noise, allowing the sharp 4-pixel bin to work everywhere.
         seeded_config = dataclasses.replace(config, window_padding_pix=400.0)
 
         cat_idxs, obs_idxs, best_affine = find_detector_consensus_matches(
@@ -81,7 +87,6 @@ def process_single_detector(
 
         count = len(matched_x)
 
-        # 3. Save matching table
         out_table = Table(
             [matched_x, matched_y, matched_ra, matched_dec, matched_mag],
             names=("x", "y", "ra_epoch", "dec_epoch", "phot_g_mean_mag"),
@@ -90,7 +95,32 @@ def process_single_detector(
         ecsv_path = os.path.join(output_dir, ecsv_filename)
         out_table.write(ecsv_path, format="ascii.ecsv", overwrite=True)
 
-        # 4. Generate DS9 Region File (.reg)
+        png_filename = f"{base_prefix}_cal.asdf_matches.png"
+        png_path = os.path.join(output_dir, png_filename)
+        try:
+            with asdf.open(asdf_path, lazy_load=True) as f:
+                data_small = f["roman"]["data"][::8, ::8].astype(np.float32)
+                ny, nx = f["roman"]["data"].shape
+
+            fig, ax = plt.subplots(figsize=(6, 6), layout="constrained")
+            lo, hi = np.nanpercentile(data_small, [5, 99.5])
+            ax.imshow(
+                data_small,
+                origin="lower",
+                cmap="gray",
+                vmin=lo,
+                vmax=hi,
+                extent=(1, nx, 1, ny),
+            )
+            ax.scatter(
+                matched_x, matched_y, s=20, facecolors="none", edgecolors="cyan", lw=0.5
+            )
+            ax.set(title=f"{det_name}: {count} Gaia matches", xlabel="x", ylabel="y")
+            fig.savefig(png_path, dpi=140, bbox_inches="tight")
+            plt.close(fig)
+        except Exception as e:
+            print(f"Warning: Failed to generate match image for {det_name}: {e}")
+
         reg_filename = f"{base_prefix}_cal.asdf_xmatch.reg"
         reg_path = os.path.join(output_dir, reg_filename)
 
@@ -123,21 +153,19 @@ def main():
 
     parser = argparse.ArgumentParser(description="Robust Cross-Matcher for Roman WFI")
     parser.add_argument(
-        "--yaml", type=str, default=None, help="Path to calibrated YAML"
+        "--siaf", type=str, default=None, help="Path to calibrated SIAF (.xml or .yml)"
     )
     args = parser.parse_args()
 
-    print("--- Robust Native gWCS Cross-Match Pipeline (Parallelized) ---")
-    if args.yaml:
-        if not os.path.exists(args.yaml):
+    print("--- Robust SIAF Cross-Match Pipeline (Parallelized) ---")
+    if args.siaf:
+        if not os.path.exists(args.siaf):
             raise FileNotFoundError(
-                f"CRITICAL: Bootstrap YAML not found at '{args.yaml}'."
+                f"CRITICAL: Bootstrap SIAF not found at '{args.siaf}'."
             )
         print(
-            f"\nBOOTSTRAP MODE ENABLED: Projecting with calibrated models from {args.yaml}"
+            f"\nBOOTSTRAP MODE ENABLED: Projecting with calibrated models from {args.siaf}"
         )
-    else:
-        print("\nBLIND MODE ENABLED: Projecting with native ASDF gWCS")
 
     gaia_file = "gaia_dr3_commissioning_field_wide.ecsv"
     print(f"Loading reference catalog: {gaia_file}")
@@ -152,7 +180,6 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     config = RobustMatchConfig()
 
-    # --- UNIFIED SCOUT PASS ---
     scout_file = next((f for f in asdf_files if "WFI01" in f.upper()), asdf_files[0])
     scout_name = os.path.basename(scout_file)
     print(
@@ -163,6 +190,9 @@ def main():
     scout_obs = Table.read(scout_cat_path, format="ascii.ecsv")
     if "flux" in scout_obs.colnames:
         scout_obs.sort("flux", reverse=True)
+
+    if len(scout_obs) > 10000:
+        scout_obs = scout_obs[:10000]
 
     scout_pixels = np.column_stack(
         [
@@ -175,10 +205,16 @@ def main():
         ]
     )
 
-    # Always use the native ASDF projection for the scout to avoid warping the scout itself
-    _, scout_pred_pixels = project_reference_catalog_to_detector(
-        scout_file, ref_catalog, config
+    # Project the scout using the user-provided SIAF XML/YAML (if available)
+    _, scout_pred_pixels = project_catalog(
+        scout_file,
+        ref_catalog,
+        config,
+        custom_siaf_filepath=args.siaf,
+        dV2=0.0,
+        dV3=0.0,
     )
+
     _, _, scout_affine = find_detector_consensus_matches(
         scout_pred_pixels,
         scout_pixels,
@@ -186,10 +222,10 @@ def main():
         seed=None,
         config=config,
     )
+
     dx_pix, dy_pix = scout_affine[2]
     print(f"Scout pixel shift locked: dx={dx_pix:.1f}, dy={dy_pix:.1f} pixels.")
 
-    # Convert the raw pixel shift into a physical V2/V3 sky correction factor
     import pysiaf
 
     rsiaf = pysiaf.Siaf("Roman")
@@ -201,11 +237,9 @@ def main():
     dV3 = v3_shift - v3_cen
     print(f"Global V2/V3 correction locked: dV2={dV2:.3f}, dV3={dV3:.3f} arcsec.")
 
-    # In Bootstrap Mode, the physical dV2/dV3 correction pre-aligns the catalog.
-    # Therefore, the pixel seed passed to the workers must be 0.0 to prevent double-shifting.
-    global_seed = np.array([0.0, 0.0]) if args.yaml else np.array([dx_pix, dy_pix])
-    passed_dV2 = dV2 if args.yaml else 0.0
-    passed_dV3 = dV3 if args.yaml else 0.0
+    global_seed = np.array([0.0, 0.0]) if args.siaf else np.array([dx_pix, dy_pix])
+    passed_dV2 = dV2 if args.siaf else 0.0
+    passed_dV3 = dV3 if args.siaf else 0.0
 
     print(f"\nDispatching {len(asdf_files)} SCAs to worker pool (4 at a time)")
     print(f"============================================================")
@@ -223,9 +257,9 @@ def main():
                 output_dir,
                 config,
                 global_seed,
-                args.yaml,
-                passed_dV2,  # Added physical V2 correction
-                passed_dV3,  # Added physical V3 correction
+                args.siaf,
+                passed_dV2,
+                passed_dV3,
             ): asdf_path
             for asdf_path in asdf_files
         }

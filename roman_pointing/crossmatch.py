@@ -102,7 +102,6 @@ def find_detector_consensus_matches(
             bin_width,
         )
     else:
-        # Seed-restricted voting window (prevents partial matching on large offsets)
         expected = pred_coords + seed
         voted_cat = pred_coords[
             np.all(
@@ -144,7 +143,8 @@ def find_detector_consensus_matches(
         co = np.zeros((3, 2))
         co[2] = [edgesx[ix] + bin_width / 2, edgesy[iy] + bin_width / 2]
 
-        radius_schedule = [20, 10, 6, 3, config.search_radius_pix]
+        radius_schedule = [80, 40, 20, 10, 5, config.search_radius_pix]
+
         for lim in radius_schedule:
             p_idx, o_idx, _ = _compute_mutual_neighbors(
                 apply_affine_transformation(pred_coords, co, detector_center, config),
@@ -184,24 +184,98 @@ def find_detector_consensus_matches(
     return p_idx, o_idx, best_affine
 
 
-def project_reference_catalog_to_detector(
-    asdf_filepath, reference_catalog, config=RobustMatchConfig()
+def project_catalog(
+    asdf_filepath,
+    reference_catalog,
+    config=RobustMatchConfig(),
+    custom_siaf_filepath=None,
+    dV2=0.0,
+    dV3=0.0,
 ):
-    """Projects Gaia sources using native gWCS and outputs PM-propagated coordinates."""
+    """Projects Gaia sources entirely using PySIAF, accepting XML or YAML overrides, falling back to PRD."""
+    import os
     import warnings
 
     import asdf
     import astropy.units as u
     import numpy as np
+    import pysiaf
+    import yaml
     from astropy.coordinates import SkyCoord
     from astropy.time import Time
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         with asdf.open(asdf_filepath, lazy_load=True) as f:
-            roman_wcs = f["roman"]["meta"]["wcs"]
             exposure_start = f["roman"]["meta"]["exposure"]["start_time"].utc.isot
             shape = f["roman"]["data"].shape
+            ra_v1 = f["roman"]["meta"]["pointing"]["ra_v1"]
+            dec_v1 = f["roman"]["meta"]["pointing"]["dec_v1"]
+            pa_v3 = f["roman"]["meta"]["pointing"]["pa_v3"]
+
+    basename = os.path.basename(asdf_filepath)
+    det = next(
+        (p for p in basename.upper().split("_") if p.startswith("WFI") and len(p) == 5),
+        None,
+    )
+    sca_key = f"{det}_FULL"
+
+    # Start with the baseline PRD SIAF
+    rsiaf = pysiaf.Siaf("Roman")
+    aper = rsiaf[sca_key]
+
+    if custom_siaf_filepath and os.path.exists(custom_siaf_filepath):
+        if custom_siaf_filepath.lower().endswith(".xml"):
+            base_dir = os.path.dirname(os.path.abspath(custom_siaf_filepath))
+            file_name = os.path.basename(custom_siaf_filepath)
+            custom_siaf = pysiaf.Siaf("Roman", basepath=base_dir, filename=file_name)
+            if sca_key in custom_siaf.apertures:
+                aper = custom_siaf[sca_key]
+
+        elif custom_siaf_filepath.lower().endswith((".yml", ".yaml")):
+            with open(custom_siaf_filepath, "r") as yf:
+                cal_data = yaml.safe_load(yf)
+
+            if sca_key in cal_data:
+                params = cal_data[sca_key]
+                aper.V2Ref = params["V2Ref"]
+                aper.V3Ref = params["V3Ref"]
+                aper.V3IdlYAngle = params["V3IdlYAngle"]
+
+                poly_coeffs = aper.get_polynomial_coefficients()
+                mapping = {}
+                idx = 0
+                for d in range(6):
+                    for y_deg in range(d + 1):
+                        mapping[idx] = f"{d - y_deg}{y_deg}"
+                        idx += 1
+
+                for i in range(len(poly_coeffs["Sci2IdlX"])):
+                    suffix = mapping[i]
+                    if f"Sci2IdlX{suffix}" in params:
+                        poly_coeffs["Sci2IdlX"][i] = params[f"Sci2IdlX{suffix}"]
+                        poly_coeffs["Sci2IdlY"][i] = params[f"Sci2IdlY{suffix}"]
+                        poly_coeffs["Idl2SciX"][i] = params[f"Idl2SciX{suffix}"]
+                        poly_coeffs["Idl2SciY"][i] = params[f"Idl2SciY{suffix}"]
+
+                lower_poly_coeffs = {k.lower(): v for k, v in poly_coeffs.items()}
+                aper.set_polynomial_coefficients(**lower_poly_coeffs)
+        else:
+            print(
+                f"\n  [WARNING] Unsupported SIAF format: {custom_siaf_filepath}. Using default PRD SIAF."
+            )
+    else:
+        if custom_siaf_filepath:
+            print(
+                f"\n  [WARNING] Provided SIAF file not found: {custom_siaf_filepath}. Using default PRD."
+            )
+        else:
+            print(
+                f"\n  [WARNING] No calibrated SIAF provided for {det}. Using default PRD SIAF."
+            )
+            print(
+                f"            If the cross-match fails due to large offsets, consider reverting to gWCS."
+            )
 
     ra_col = "ra_epoch" if "ra_epoch" in reference_catalog.colnames else "ra"
     dec_col = "dec_epoch" if "dec_epoch" in reference_catalog.colnames else "dec"
@@ -218,120 +292,12 @@ def project_reference_catalog_to_detector(
         warnings.simplefilter("ignore")
         propagated_sky = sky_coords.apply_space_motion(new_obstime=Time(exposure_start))
 
-    # --- 1-PASS ROBUST EVALUATION ---
-    # Disable bounding box to allow clean polynomial evaluation off-chip
-    original_bbox = roman_wcs.bounding_box
-    roman_wcs.bounding_box = None
-    pixel_x, pixel_y = roman_wcs.world_to_pixel(propagated_sky)
-    roman_wcs.bounding_box = original_bbox
-
-    valid_pixels = np.isfinite(pixel_x) & np.isfinite(pixel_y)
-    pixel_x = pixel_x[valid_pixels]
-    pixel_y = pixel_y[valid_pixels]
-
-    filtered_catalog = reference_catalog[valid_pixels]
-    prop_ra = propagated_sky.ra.deg[valid_pixels]
-    prop_dec = propagated_sky.dec.deg[valid_pixels]
-
-    ny, nx = shape
-    # Expand padding to safely encompass the bulk pointing error without clipping
-    pad = config.window_padding_pix + 4000
-    in_bounds = (
-        (pixel_x >= -pad)
-        & (pixel_x <= nx + pad)
-        & (pixel_y >= -pad)
-        & (pixel_y <= ny + pad)
-    )
-
-    final_catalog = filtered_catalog[in_bounds]
-    predicted_pixels = np.column_stack([pixel_x[in_bounds] + 1, pixel_y[in_bounds] + 1])
-
-    # OVERRIDE original catalog RA/Dec with PM-propagated coordinates to eliminate the 58 mas bias
-    final_catalog["ra_epoch"] = prop_ra[in_bounds]
-    final_catalog["dec_epoch"] = prop_dec[in_bounds]
-
-    brightness_rank = np.argsort(np.asarray(final_catalog["phot_g_mean_mag"]))
-    return final_catalog[brightness_rank], predicted_pixels[brightness_rank]
-
-
-def project_with_calibrated_siaf(
-    asdf_filepath, reference_catalog, yaml_filepath, config, dV2=0.0, dV3=0.0
-):
-    """Projects Gaia sources using PySIAF updated with a calibrated YAML distortion model."""
-    import os
-
-    import asdf
-    import astropy.units as u
-    import numpy as np
-    import pysiaf
-    import yaml
-    from astropy.coordinates import SkyCoord
-    from astropy.time import Time
-
-    with open(yaml_filepath, "r") as yf:
-        cal_data = yaml.safe_load(yf)
-
-    with asdf.open(asdf_filepath, lazy_load=True) as f:
-        exposure_start = f["roman"]["meta"]["exposure"]["start_time"].utc.isot
-        shape = f["roman"]["data"].shape
-        ra_v1 = f["roman"]["meta"]["pointing"]["ra_v1"]
-        dec_v1 = f["roman"]["meta"]["pointing"]["dec_v1"]
-        pa_v3 = f["roman"]["meta"]["pointing"]["pa_v3"]
-
-    basename = os.path.basename(asdf_filepath)
-    det = next(
-        (p for p in basename.upper().split("_") if p.startswith("WFI") and len(p) == 5),
-        None,
-    )
-    sca_key = f"{det}_FULL"
-
-    rsiaf = pysiaf.Siaf("Roman")
-    aper = rsiaf[sca_key]
-
-    if sca_key in cal_data:
-        params = cal_data[sca_key]
-        aper.V2Ref = params["V2Ref"]
-        aper.V3Ref = params["V3Ref"]
-        aper.V3IdlYAngle = params["V3IdlYAngle"]
-
-        poly_coeffs = aper.get_polynomial_coefficients()
-        mapping = {}
-        idx = 0
-        for d in range(6):
-            for y_deg in range(d + 1):
-                mapping[idx] = f"{d - y_deg}{y_deg}"
-                idx += 1
-
-        for i in range(len(poly_coeffs["Sci2IdlX"])):
-            suffix = mapping[i]
-            if f"Sci2IdlX{suffix}" in params:
-                poly_coeffs["Sci2IdlX"][i] = params[f"Sci2IdlX{suffix}"]
-                poly_coeffs["Sci2IdlY"][i] = params[f"Sci2IdlY{suffix}"]
-                poly_coeffs["Idl2SciX"][i] = params[f"Idl2SciX{suffix}"]
-                poly_coeffs["Idl2SciY"][i] = params[f"Idl2SciY{suffix}"]
-
-        lower_poly_coeffs = {k.lower(): v for k, v in poly_coeffs.items()}
-        aper.set_polynomial_coefficients(**lower_poly_coeffs)
-
-    ra_col = "ra_epoch" if "ra_epoch" in reference_catalog.colnames else "ra"
-    dec_col = "dec_epoch" if "dec_epoch" in reference_catalog.colnames else "dec"
-
-    sky_coords = SkyCoord(
-        ra=np.asarray(reference_catalog[ra_col]) * u.deg,
-        dec=np.asarray(reference_catalog[dec_col]) * u.deg,
-        pm_ra_cosdec=np.asarray(reference_catalog["pmra"]) * u.mas / u.yr,
-        pm_dec=np.asarray(reference_catalog["pmdec"]) * u.mas / u.yr,
-        obstime=Time(np.asarray(reference_catalog["ref_epoch"]), format="jyear"),
-    )
-    propagated_sky = sky_coords.apply_space_motion(new_obstime=Time(exposure_start))
     prop_ra = propagated_sky.ra.deg
     prop_dec = propagated_sky.dec.deg
 
     att = pysiaf.utils.rotations.attitude(0, 0, ra_v1, dec_v1, pa_v3)
     v2, v3 = pysiaf.utils.rotations.getv2v3(att, prop_ra, prop_dec)
 
-    # --- DYNAMIC ATTITUDE CORRECTION ---
-    # Apply the bulk shift in physical space to bypass the Tangent Warp
     v2 += dV2
     v3 += dV3
 
@@ -345,7 +311,7 @@ def project_with_calibrated_siaf(
     prop_dec = prop_dec[valid_pixels]
 
     ny, nx = shape
-    pad = config.window_padding_pix + 4000
+    pad = config.window_padding_pix + 15000
     in_bounds = (
         (pixel_x >= -pad)
         & (pixel_x <= nx + pad)

@@ -11,7 +11,6 @@ Executes two sequential tasks:
 """
 
 import glob
-import json
 import os
 import warnings
 from pathlib import Path
@@ -27,20 +26,47 @@ from astropy.time import Time
 from scipy.spatial.transform import Rotation as R
 
 import roman_pointing.alignment
-
-# Import the core modules from the unified workflow
 from roman_pointing import (
     align_wfi,
     apply_dva_scale_to_catalog,
     calibrate_roman_fgs_alignment,
-    export_alignment_to_yaml,
-    fetch_local_commissioning_gaia,
 )
 
+# =========================================================================
+# GLOBAL CONFIGURATION & OVERRIDES
+# =========================================================================
+# --- CROSSMATCH INPUT DIRECTORY ---
+CROSSMATCH_DIR = "crossmatch_results"
 
-def load_standalone_matches(
-    output_dir="roman_gaia_match",
-):  # other option is 'roman_gaia_match'
+# --- ALIGNMENT MODE ---
+# Set to 5 for Full 5th-Order Polynomials (absorbs DVA).
+# Set to 1 for standard Affine transformations (Scale & Skew only).
+FIT_DEGREE = 5
+
+# Toggle to enable/disable Differential Velocity Aberration (DVA) correction
+# Only turn it off if spacecraft velocities are missing or corrupted.
+APPLY_DVA = True
+
+# --- MANUAL TELEMETRY OVERRIDES ---
+# Set to a float to override pipeline metadata, or None to read from ASDF.
+MANUAL_RA_V1 = None
+MANUAL_DEC_V1 = None
+MANUAL_PA_V3 = None
+
+MANUAL_VX_KMS = None
+MANUAL_VY_KMS = None
+MANUAL_VZ_KMS = None
+
+# Set to a list/tuple of 4 floats to override qbj, or None to calculate from pointing.
+# Example: MANUAL_QBJ = [0.70515723, 0.08269192, -0.68259625, -0.17314064]
+MANUAL_QBJ = None
+
+# --- CUSTOM SIAF TOGGLE ---
+CUSTOM_SIAF_PATH = None  # Use this only when testing. Otherwise, start from PRD SIAF.
+# =========================================================================
+
+
+def load_standalone_matches(output_dir=CROSSMATCH_DIR):
     import glob
     import os
 
@@ -49,8 +75,6 @@ def load_standalone_matches(
     from astropy.table import Table
 
     matched_data = {}
-
-    # Efficiently gather files from either workflow
     ecsv_files = glob.glob(f"{output_dir}/*_xmatch.ecsv") + glob.glob(
         f"{output_dir}/*_matches.ecsv"
     )
@@ -62,8 +86,6 @@ def load_standalone_matches(
     for f in ecsv_files:
         basename = os.path.basename(f)
         parts = basename.upper().split("_")
-
-        # This safely extracts 'WFI14' from both "WFI14_matches.ecsv" and "r010..._wfi14_..._xmatch.ecsv"
         det = next(
             (part for part in parts if part.startswith("WFI") and len(part) == 5), None
         )
@@ -73,8 +95,6 @@ def load_standalone_matches(
         sca_key = f"{det}_FULL" if not det.endswith("_FULL") else det
         t = Table.read(f, format="ascii.ecsv")
 
-        # --- ROBUST OUTLIER SHIELD ---
-        # Applied to both datasets to ensure a perfect 1-to-1 comparison for the alignment solver
         init_model = models.Polynomial2D(degree=2)
         fitter = fitting.LinearLSQFitter()
 
@@ -88,14 +108,12 @@ def load_standalone_matches(
 
         keep = scatter_arcsec < 5.0
         t = t[keep]
-        # -----------------------------
 
         matched_data[sca_key] = {
             "x_obs": np.array(t["x"]),
             "y_obs": np.array(t["y"]),
             "ra_cat": np.array(t["ra_epoch"]),
             "dec_cat": np.array(t["dec_epoch"]),
-            # Add this line to pass the magnitude data to the logger
             "mag_cat": np.array(t["phot_g_mean_mag"])
             if "phot_g_mean_mag" in t.colnames
             else np.full(len(t), 99.0),
@@ -120,11 +138,8 @@ def export_custom_siaf_yaml(
     output_filename = f"{output_prefix}_{current_date}.yml"
     yaml_lines = [f"version: '{current_date}'"]
 
-    # Write the special center apertures first (no distortions)
     for special_cen in ["WFI_CEN", "WFI_TILE", "CGI_CEN"]:
-        # WFI_TILE is a pseudo-aperture that perfectly mirrors WFI_CEN
         source_key = "WFI_CEN" if special_cen == "WFI_TILE" else special_cen
-
         if source_key in calibrated_siaf_params:
             params = calibrated_siaf_params[source_key]
             yaml_lines.append(f"{special_cen}:")
@@ -132,7 +147,6 @@ def export_custom_siaf_yaml(
             yaml_lines.append(f"  V3Ref: {params['V3Ref']:.3f}")
             yaml_lines.append(f"  V3IdlYAngle: {params['V3IdlYAngle']:.5f}")
 
-    # Dynamically calculate the number of coefficients and mapping
     num_coeffs = int((fit_degree + 1) * (fit_degree + 2) / 2)
     mapping = {
         idx: f"{d}{y_deg}"
@@ -141,9 +155,7 @@ def export_custom_siaf_yaml(
         )
     }
 
-    # Loop through the SCAs, skipping the special centers
     for sca_name in sorted(calibrated_siaf_params.keys()):
-        # Protect against printing centers twice if they sneak into the main dictionary
         if any(
             skip_str in sca_name.upper()
             for skip_str in ["WFI_CEN", "WFI_TILE", "CGI_CEN"]
@@ -171,41 +183,6 @@ def export_custom_siaf_yaml(
 
 
 def main():
-    # =========================================================================
-    # CONFIGURATION & OVERRIDES
-    # =========================================================================
-    # --- ALIGNMENT MODE ---
-    # Set to 5 for Full 5th-Order Polynomials (absorbs DVA).
-    # Set to 1 for standard Affine transformations (Scale & Skew only).
-    FIT_DEGREE = 5
-    # ----------------------
-
-    # Toggle to enable/disable Differential Velocity Aberration (DVA) correction
-    # Only turn it off if spacecraft velocities are missing or corrupted.
-    apply_dva = True
-
-    # --- MANUAL TELEMETRY OVERRIDES ---
-    # Set to a float to override pipeline metadata, or None to read from ASDF.
-    MANUAL_RA_V1 = None
-    MANUAL_DEC_V1 = None
-    MANUAL_PA_V3 = None
-
-    MANUAL_VX_KMS = None
-    MANUAL_VY_KMS = None
-    MANUAL_VZ_KMS = None
-
-    # Set to a list/tuple of 4 floats to override qbj, or None to calculate from pointing.
-    # Example: MANUAL_QBJ = [0.70515723, 0.08269192, -0.68259625, -0.17314064]
-    MANUAL_QBJ = None
-    # ----------------------------------
-
-    # --- CUSTOM SIAF TOGGLE ---
-    CUSTOM_SIAF_PATH = None  # Use this only when testing!!! Otherwise, start from the pre-flight PRD SIAF.
-    # ----------------------------------
-
-    # =========================================================================
-    # 1. DATA INGEST & INITIALIZATION
-    # =========================================================================
     print("--- 1. DATA INGEST ---")
 
     if CUSTOM_SIAF_PATH and os.path.exists(CUSTOM_SIAF_PATH):
@@ -218,7 +195,7 @@ def main():
         roman_siaf = pysiaf.Siaf("Roman")
         pristine_siaf = pysiaf.Siaf("Roman")
         print("Loaded default PRD SIAF via pysiaf.")
-    # Reconstruct the phot_catalogs dictionary from the ECSV files
+
     ecsv_files = sorted(glob.glob("*_wfi??_f146_cal.asdf_catalog.ecsv"))
     print(f"Found {len(ecsv_files)} extracted catalogs to align.")
 
@@ -231,7 +208,6 @@ def main():
     phot_catalogs = {}
     for filepath in ecsv_files:
         basename = os.path.basename(filepath)
-        # Parse out the WFI chip ID (e.g., 'WFI01')
         parts = basename.upper().split("_")
         sca_name = next(
             (part for part in parts if part.startswith("WFI") and len(part) == 5), None
@@ -247,11 +223,7 @@ def main():
         print("Error: No valid catalogs loaded into memory. Exiting.")
         return
 
-    # ---------------------------------------------------------
-    # FILTER OBSERVED CATALOGS BY BRIGHTNESS
-    # ---------------------------------------------------------
     max_observed_stars = int(1e7)
-
     for sca_key, cat in phot_catalogs.items():
         mag_col = None
         for candidate in ["mag", "instrumental_mag", "phot_g_mean_mag"]:
@@ -281,7 +253,6 @@ def main():
     print(f"\nExtracting reference observation metadata from: {original_asdf}")
 
     with rdm.open(original_asdf) as f:
-        # 1. Pointing Meta (Extracted strictly from pure quaternion to avoid VA double-counting)
         try:
             if MANUAL_QBJ is not None:
                 acs_telemetry_qbj = np.array(MANUAL_QBJ)
@@ -297,7 +268,6 @@ def main():
                     "  -> Extracted pure Telemetry Quaternion (SCF_AC_SDR_QBJ) from ASDF."
                 )
 
-            # Calculate RA_V1, DEC_V1, PA_V3 from the pure quaternion
             r_att = R.from_quat(acs_telemetry_qbj)
             ra_v1, dec_v1 = pysiaf.utils.rotations.pointing(r_att.as_matrix(), 0, 0)
             pa_v3 = pysiaf.utils.rotations.posangle(r_att.as_matrix(), 0, 0)
@@ -309,7 +279,6 @@ def main():
             print(f"Error: Pointing quaternion metadata missing from ASDF: {e}")
             return
 
-        # 2. DVA Meta
         try:
             dva_scale = f.meta.velocity_aberration.scale_factor
             dva_ra_ref = f.meta.velocity_aberration.ra_reference
@@ -321,7 +290,6 @@ def main():
                 "Warning: DVA metadata not found in ASDF. DVA correction will NOT be applied."
             )
 
-        # 3. Spacecraft Velocity Meta (with manual override check)
         try:
             v_x = (
                 MANUAL_VX_KMS
@@ -345,7 +313,6 @@ def main():
             )
             return
 
-        # 4. Observation Date
         try:
             obs_date_str = f.meta.exposure.start_time
         except AttributeError:
@@ -368,9 +335,6 @@ def main():
         ]
     )
 
-    # ---------------------------------------------------------
-
-    # Load the Gaia DR3 catalog
     try:
         cat_file = "gaia_dr3_commissioning_field_wide.ecsv"
         print(f"  -> Loading reference catalog: {cat_file}")
@@ -380,7 +344,6 @@ def main():
             f"  -> Propagating Gaia proper motions to {obs_date_str} (Parallax forced to 0.0)"
         )
 
-        # Use np.asarray to strip the intrinsic ECSV 'deg' units before applying Astropy's u.deg
         sky_coords = SkyCoord(
             ra=np.asarray(ref_catalog["ra"]) * u.deg,
             dec=np.asarray(ref_catalog["dec"]) * u.deg,
@@ -389,7 +352,6 @@ def main():
             obstime=Time(np.asarray(ref_catalog["ref_epoch"]), format="jyear"),
         )
 
-        # Suppress the harmless ErfaWarning for missing 3D parallax
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             propagated_sky = sky_coords.apply_space_motion(
@@ -399,10 +361,8 @@ def main():
         ref_catalog["ra_epoch"] = propagated_sky.ra.deg
         ref_catalog["dec_epoch"] = propagated_sky.dec.deg
 
-        # Sort the reference catalog by Gaia G-band magnitude (ascending order: brightest first)
         ref_catalog.sort("phot_g_mean_mag")
 
-        # Keep only stars brighter than a certain magnitude threshold (e.g., G < 19.0)
         mag_bright = 12.0
         mag_faint = 19.0
         bright_mask = (ref_catalog["phot_g_mean_mag"] <= mag_faint) & (
@@ -413,8 +373,7 @@ def main():
             f"  -> Filtered reference catalog: {len(ref_catalog)} stars with {mag_bright} < G <= {mag_faint}"
         )
 
-        # --- APPLY DIFFERENTIAL VELOCITY ABERRATION ---
-        if apply_dva and has_dva_meta:
+        if APPLY_DVA and has_dva_meta:
             print("  -> Applying Differential Velocity Aberration (DVA) to Gaia...")
             app_ra, app_dec = apply_dva_scale_to_catalog(
                 np.asarray(ref_catalog["ra_epoch"]),
@@ -423,21 +382,14 @@ def main():
                 dva_dec_ref,
                 dva_scale,
             )
-            # Overwrite the catalog columns so align_wfi sees the Apparent Sky
             ref_catalog["ra_epoch"] = app_ra
             ref_catalog["dec_epoch"] = app_dec
-        # ----------------------------------------------
 
     except Exception as e:
         print(f"Error loading local Gaia catalog: {e}")
         return
 
-    # =========================================================================
-    # 2. WFI MACROSCOPIC ALIGNMENT (Local Geometry)
-    # =========================================================================
     print("\n--- 2. RUNNING WFI ALIGNMENT ---")
-
-    import roman_pointing.alignment
 
     roman_pointing.alignment.load_standalone_matches = load_standalone_matches
 
@@ -450,10 +402,9 @@ def main():
         target_wfi_cen=None,
         roman_siaf=roman_siaf,
         fit_degree=FIT_DEGREE,
-        precomputed_matches_dir="roman_gaia_match",
+        precomputed_matches_dir=CROSSMATCH_DIR,
     )
 
-    # --- CALCULATE GLOBAL OFFSETS ---
     mean_dec_rad = np.deg2rad(attitude_results["DEC_V1"])
     d_ra_arcsec = (attitude_results["RA_V1"] - ra_v1) * np.cos(mean_dec_rad) * 3600.0
     d_dec_arcsec = (attitude_results["DEC_V1"] - dec_v1) * 3600.0
@@ -466,10 +417,8 @@ def main():
     print(f"Δ Dec (V1): {d_dec_arcsec:8.2f} arcsec")
     print(f"Δ PA  (V3): {d_pa_arcsec:8.2f} arcsec")
 
-    # --- RIGOROUS SKY-TO-TELESCOPE DELTA SHIFT ---
     print("\nApplying rigorous rigid-body delta offsets to the SIAF...")
 
-    # 1. Transform RA/Dec deltas into the V2/V3 frame preserving optical parity
     pa_rad = np.deg2rad(pointing_info["PA_V3"])
     cos_pa, sin_pa = np.cos(pa_rad), np.sin(pa_rad)
 
@@ -477,12 +426,10 @@ def main():
     delta_v3_arcsec = +(d_ra_arcsec * sin_pa - d_dec_arcsec * cos_pa)
     delta_pa_deg = d_pa_arcsec / 3600.0
 
-    # 2. Set up the rigid body pivot around WFI_CEN
     base_cen = roman_siaf["WFI_CEN"]
     dtheta_rad = np.deg2rad(delta_pa_deg)
     cos_t, sin_t = np.cos(dtheta_rad), np.sin(dtheta_rad)
 
-    # 3. Orbit and translate every chip to prevent the "hurricane" twist
     for sca_name in list(calibrated_siaf_params.keys()):
         if sca_name in ["WFI_CEN", "WFI_TILE", "CGI_CEN"]:
             continue
@@ -490,11 +437,9 @@ def main():
         v2_local = calibrated_siaf_params[sca_name]["V2Ref"]
         v3_local = calibrated_siaf_params[sca_name]["V3Ref"]
 
-        # Vector from the central pivot point to the individual chip
         dx = v2_local - base_cen.V2Ref
         dy = v3_local - base_cen.V3Ref
 
-        # Apply strict translation and proper V2/V3 parity orbit
         calibrated_siaf_params[sca_name]["V2Ref"] = (
             base_cen.V2Ref + delta_v2_arcsec + (dx * cos_t + dy * sin_t)
         )
@@ -503,16 +448,12 @@ def main():
         )
         calibrated_siaf_params[sca_name]["V3IdlYAngle"] += delta_pa_deg
 
-    # 4. Shift the center itself
     calibrated_siaf_params["WFI_CEN"] = {
         "V2Ref": base_cen.V2Ref + delta_v2_arcsec,
         "V3Ref": base_cen.V3Ref + delta_v3_arcsec,
         "V3IdlYAngle": base_cen.V3IdlYAngle + delta_pa_deg,
     }
 
-    # =========================================================================
-    # 3. FGS BORESIGHT CALIBRATION (Spacecraft Geometry)
-    # =========================================================================
     print("\n--- 3. RUNNING FGS BORESIGHT CALIBRATION ---")
 
     ref_stars_radec = np.array([[row[3], row[4]] for row in matched_pairs_log])
@@ -537,27 +478,21 @@ def main():
             f"[{q_b2fgs_calibrated[0]:.17f}, {q_b2fgs_calibrated[1]:.17f}, {q_b2fgs_calibrated[2]:.17f}, {q_b2fgs_calibrated[3]:.17f}]"
         )
 
-        # 1. Calculate the rotation required to align Old FGS to New FGS
         q_nom = R.from_quat(q_b2fgs_preflight)
         q_cal = R.from_quat(q_b2fgs_calibrated)
         delta_q = q_cal * q_nom.inv()
 
-        # 2. Project the Boresight Vector (V1 axis: [1, 0, 0])
         v1_nominal = np.array([1, 0, 0])
         v1_calibrated = delta_q.apply(v1_nominal)
 
-        # Calculate the angular separation between the old and new boresight
         cos_theta = np.clip(np.dot(v1_nominal, v1_calibrated), -1.0, 1.0)
         boresight_shift_arcsec = np.degrees(np.arccos(cos_theta)) * 3600.0
 
         print(f"Total Boresight Shift (V1 Bore): {boresight_shift_arcsec:.3f} arcsec")
         print("--------------------------------------------------------\n")
 
-        # --- EXTRACT PRODUCTION HARDWARE ANGLES FROM BAM ---
-        # Input quaternion is FGS -> Body. The forward construction is Body -> FGS.
         m_b2fgs = R.from_quat(q_b2fgs_calibrated).inv().as_matrix()
 
-        # Remove the fixed X->Z coordinate permutation.
         m_x2z = np.array(
             [
                 [0.0, 1.0, 0.0],
@@ -567,7 +502,6 @@ def main():
         )
         a = m_x2z.T @ m_b2fgs
 
-        # Small-offset direct trigonometric extraction
         bz_rad = np.arcsin(np.clip(a[0, 2], -1.0, 1.0))
         by_rad = np.arctan2(-a[0, 1], a[0, 0])
         ya_rad = np.arctan2(-a[1, 2], a[2, 2])
@@ -576,7 +510,6 @@ def main():
         hw_v2 = np.rad2deg(by_rad) * 3600.0
         hw_v3 = np.rad2deg(bz_rad) * 3600.0
 
-        # Apply reporting convention wraps and inversions (Undo the full hw_angle negation here)
         hw_angle -= 180.0
         hw_angle = (hw_angle + 180.0) % 360.0 - 180.0
         hw_v2 *= -1.0
@@ -585,15 +518,12 @@ def main():
             f"BAM-Derived WFI_CEN -> V2: {hw_v2:.3f}, V3: {hw_v3:.3f}, Angle: {hw_angle:.5f}"
         )
 
-        # --- EXTRACT NOMINAL HARDWARE ANGLE FOR PURE DELTA CALCULATION ---
         m_b2fgs_nom = R.from_quat(q_b2fgs_preflight).inv().as_matrix()
         a_nom = m_x2z.T @ m_b2fgs_nom
         ya_nom_rad = np.arctan2(-a_nom[1, 2], a_nom[2, 2])
         hw_angle_nom = np.rad2deg(ya_nom_rad)
         hw_angle_nom -= 180.0
         hw_angle_nom = (hw_angle_nom + 180.0) % 360.0 - 180.0
-
-        # Extract the pure hardware rotational delta
         delta_hw_angle = hw_angle - hw_angle_nom
 
     except Exception as e:
@@ -612,9 +542,6 @@ def main():
     print("                  quaternion to Flight Software.")
     print("========================================================\n")
 
-    # =========================================================================
-    # 4. RE-GENERATE DIAGNOSTICS & EXPORT YAML
-    # =========================================================================
     from roman_pointing.diagnostics import generate_alignment_diagnostics
 
     generate_alignment_diagnostics(
@@ -622,7 +549,7 @@ def main():
         iteration_history=attitude_results.get("iteration_history", []),
         output_dir="./diagnostics",
         calibrated_siaf_params=calibrated_siaf_params,
-        nominal_siaf=pristine_siaf,  # <--- CRITICAL FIX: Feeds the pristine baseline
+        nominal_siaf=pristine_siaf,
     )
 
     pd.DataFrame(
@@ -642,11 +569,9 @@ def main():
         ],
     ).to_csv("verification_catalog.csv", index=False)
 
-    # --- RIGID-BODY ANCHOR (RESTORE TO BAM-DERIVED BASELINE) ---
     print("\nAnchoring rigid mosaic to the newly derived BAM center...")
 
     try:
-        # Pull the true hardware values calculated by Wahba's problem in Step 3
         bam_v2, bam_v3, bam_angle = hw_v2, hw_v3, hw_angle
     except NameError:
         print("Warning: FGS Boresight failed. Falling back to pristine SIAF center.")
@@ -656,7 +581,6 @@ def main():
 
     step2_cen = calibrated_siaf_params["WFI_CEN"]
 
-    # Calculate the exact rotation and translation to lock to the BAM
     dAngle_bulk = bam_angle - step2_cen["V3IdlYAngle"]
     dtheta_rad = np.deg2rad(dAngle_bulk)
     cos_t, sin_t = np.cos(dtheta_rad), np.sin(dtheta_rad)
@@ -665,25 +589,19 @@ def main():
         if "WFI_CEN" in sca or "CGI_CEN" in sca:
             continue
 
-        # Vector from the floating mosaic center to the individual SCA
         dx = calibrated_siaf_params[sca]["V2Ref"] - step2_cen["V2Ref"]
         dy = calibrated_siaf_params[sca]["V3Ref"] - step2_cen["V3Ref"]
 
-        # Orbit the chips correctly around the center to prevent the hurricane twist
         calibrated_siaf_params[sca]["V2Ref"] = bam_v2 + (dx * cos_t + dy * sin_t)
         calibrated_siaf_params[sca]["V3Ref"] = bam_v3 + (-dx * sin_t + dy * cos_t)
         calibrated_siaf_params[sca]["V3IdlYAngle"] += dAngle_bulk
 
-    # Lock the center itself perfectly to the BAM coordinates
     calibrated_siaf_params["WFI_CEN"] = {
         "V2Ref": bam_v2,
         "V3Ref": bam_v3,
         "V3IdlYAngle": bam_angle,
     }
 
-    # --- SPHERICAL GEOMETRY UPDATE FOR CGI_CEN ---
-    # Due to CGI's large offset from the WFI center, we use 3D spherical rotation
-    # anchored against the pristine pre-flight baseline.
     if "CGI_CEN" in pristine_siaf.apertures:
         cgi_old = pristine_siaf["CGI_CEN"]
         wfi_old = pristine_siaf["WFI_CEN"]
@@ -691,13 +609,11 @@ def main():
         v2_wfi_old, v3_wfi_old = wfi_old.V2Ref, wfi_old.V3Ref
         v2_wfi_new, v3_wfi_new = bam_v2, bam_v3
 
-        # Construct local sky rotation matrices
         M_old = pysiaf.utils.rotations.attitude(v2_wfi_old, v3_wfi_old, 0.0, 0.0, 0.0)
         M_new = pysiaf.utils.rotations.attitude(
             v2_wfi_new, v3_wfi_new, 0.0, 0.0, dAngle_bulk
         )
 
-        # Convert CGI old V2/V3 to 3D Cartesian vector
         c2_rad = np.deg2rad(cgi_old.V2Ref / 3600.0)
         c3_rad = np.deg2rad(cgi_old.V3Ref / 3600.0)
         cgi_vec_old = np.array(
@@ -708,11 +624,9 @@ def main():
             ]
         )
 
-        # Body-to-Sky transform, then Sky-to-Body transform with the new BAM center
         cgi_vec_sky = np.dot(M_old, cgi_vec_old)
         cgi_vec_new = np.dot(M_new.T, cgi_vec_sky)
 
-        # Convert back to V2/V3 arcsec
         v2_cgi_new = np.rad2deg(np.arctan2(cgi_vec_new[1], cgi_vec_new[0])) * 3600.0
         v3_cgi_new = np.rad2deg(np.arcsin(cgi_vec_new[2])) * 3600.0
         angle_cgi_new = cgi_old.V3IdlYAngle + dAngle_bulk
@@ -726,7 +640,6 @@ def main():
             f"Updated CGI_CEN -> V2Ref: {v2_cgi_new:.3f}, V3Ref: {v3_cgi_new:.3f}, Angle: {angle_cgi_new:.5f}"
         )
 
-    # Export to SIAF YAML
     output_yaml = export_custom_siaf_yaml(
         calibrated_siaf_params=calibrated_siaf_params,
         roman_siaf=roman_siaf,
