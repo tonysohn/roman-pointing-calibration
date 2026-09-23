@@ -171,7 +171,7 @@ def main():
     print(f"Loading reference catalog: {gaia_file}")
     ref_catalog = Table.read(gaia_file, format="ascii.ecsv")
 
-    asdf_files = sorted(glob.glob("*_f146_cal.asdf"))
+    asdf_files = sorted(glob.glob("*_cal.asdf"))
     if not asdf_files:
         print("Error: No calibrated ASDF files found.")
         return
