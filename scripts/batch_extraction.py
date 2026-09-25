@@ -1,16 +1,57 @@
 #!/usr/bin/env python3
 import argparse
+import concurrent.futures
 import glob
 import os
-
-import numpy as np
 
 from roman_pointing import extract_wfi_sources
 
 
+def process_single_file(args):
+    """
+    Worker function to process a single ASDF file.
+    Runs independently on a separate CPU core.
+    """
+    filepath, strategy, target_dir = args  # Unpack the arguments tuple directly
+
+    basename = os.path.basename(filepath)
+    parts = basename.upper().split("_")
+    sca_name = next(
+        (part for part in parts if part.startswith("WFI") and len(part) == 5), None
+    )
+
+    if not sca_name:
+        return f"[!] Could not parse SCA name from filename: {basename}"
+
+    dict_key = f"{sca_name}_FULL"
+
+    try:
+        catalog = extract_wfi_sources(
+            asdf_filepath=filepath,
+            centroid_method=strategy,
+            save_diagnostic_plot=True,
+            plot_outdir=target_dir,
+        )
+
+        if len(catalog) > 0:
+            fmt_catalog = catalog.copy()
+            for col in fmt_catalog.colnames:
+                if fmt_catalog[col].dtype.kind in "fc":
+                    fmt_catalog[col].format = "%.4f"
+
+            out_filename = os.path.join(target_dir, f"{basename}_catalog.ecsv")
+            fmt_catalog.write(out_filename, format="ascii.ecsv", overwrite=True)
+            return f"[{dict_key}] Successfully exported {len(fmt_catalog)} sources to {out_filename}"
+        else:
+            return f"[{dict_key}] Skipped: No valid sources extracted."
+
+    except Exception as e:
+        return f"[{dict_key}] Error processing {basename}: {e}"
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Batch extract WFI sources from ASDF files."
+        description="Batch extract WFI sources from ASDF files using Multiprocessing."
     )
     parser.add_argument(
         "target_dir",
@@ -25,11 +66,14 @@ def main():
         choices=["gaussian", "epsf"],
         help="Extraction strategy: 'gaussian' (fast) or 'epsf' (high-fidelity)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of CPU cores to use. Defaults to all available cores.",
+    )
     args = parser.parse_args()
 
-    phot_catalogs = {}
-
-    # Locate all calibrated files dynamically in the target directory
     search_pattern = os.path.join(args.target_dir, "*_cal.asdf")
     input_files = sorted(glob.glob(search_pattern))
 
@@ -37,45 +81,27 @@ def main():
         print(f"No calibrated ASDF files found in '{args.target_dir}'.")
         return
 
+    # Determine optimal worker count
+    max_cores = os.cpu_count() or 1
+    num_workers = args.workers if args.workers else min(len(input_files), max_cores)
+
     print(
         f"Found {len(input_files)} calibrated files in '{args.target_dir}' to process."
     )
-    print(f"Using extraction strategy: '{args.strategy}'\n")
+    print(f"Using extraction strategy: '{args.strategy}'")
+    print(f"Spinning up {num_workers} parallel workers...\n")
 
-    for filepath in input_files:
-        basename = os.path.basename(filepath)
+    # Package arguments as a list of tuples
+    worker_args = [
+        (filepath, args.strategy, args.target_dir) for filepath in input_files
+    ]
 
-        parts = basename.upper().split("_")
-        sca_name = next(
-            (part for part in parts if part.startswith("WFI") and len(part) == 5), None
-        )
+    # Execute batch processing in parallel directly on the top-level function
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        results = executor.map(process_single_file, worker_args)
 
-        if sca_name:
-            dict_key = f"{sca_name}_FULL"
-
-            catalog = extract_wfi_sources(
-                asdf_filepath=filepath,
-                centroid_method=args.strategy,
-                save_diagnostic_plot=True,
-                plot_outdir=args.target_dir,
-            )
-
-            if len(catalog) > 0:
-                phot_catalogs[dict_key] = catalog
-
-                fmt_catalog = catalog.copy()
-                for col in fmt_catalog.colnames:
-                    if fmt_catalog[col].dtype.kind in "fc":
-                        fmt_catalog[col].format = "%.4f"
-
-                # Save output ECSV in the same directory as the target ASDFs
-                out_filename = os.path.join(args.target_dir, f"{basename}_catalog.ecsv")
-                fmt_catalog.write(out_filename, format="ascii.ecsv", overwrite=True)
-                print(f"  -> Exported formatted ECSV catalog: {out_filename}")
-            else:
-                print(f"Skipping {dict_key}: No valid sources extracted.")
-        else:
-            print(f"Could not parse SCA name from filename: {basename}")
+        for output_message in results:
+            print(output_message)
 
     print("\nBatch extraction complete.")
 

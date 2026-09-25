@@ -8,12 +8,15 @@ import roman_datamodels as rdm
 import stpsf
 from astropy.modeling.fitting import LevMarLSQFitter
 from astropy.table import Table
+from astropy.utils.exceptions import AstropyWarning
 from astropy.visualization import simple_norm
 from photutils.aperture import CircularAnnulus, CircularAperture
 from photutils.background import MADStdBackgroundRMS, MMMBackground
 from photutils.centroids import centroid_2dg, centroid_sources
 from photutils.detection import DAOStarFinder, IRAFStarFinder
 from photutils.psf import GriddedPSFModel, IterativePSFPhotometry
+
+warnings.filterwarnings("ignore", message=".*Input data contains invalid values.*")
 
 
 def load_phot_config(config_path="car086_phot_config.json"):
