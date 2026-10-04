@@ -74,9 +74,8 @@ def export_custom_siaf_yaml(
     output_prefix="calibrated_roman_siaf",
     fit_degree=5,
 ):
-    from datetime import datetime
-
-    current_date = datetime.now().strftime("%Y%m%d")
+    # Enforce UTC time for the YAML export
+    current_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
     output_filename = f"{output_prefix}_{current_date}.yml"
     yaml_lines = [f"version: '{current_date}'"]
 
@@ -156,8 +155,9 @@ def calculate_cgi_to_body_quaternion(
 
 
 def export_acs_bam_file(instrument, q_array, start_time_str, end_time_str):
-    """Exports strict ACS-compliant BAM text files."""
-    now = datetime.datetime.now()
+    """Exports strict ACS-compliant BAM text files with UTC timestamps."""
+    # Enforce UTC time for the BAM export
+    now = datetime.datetime.now(datetime.timezone.utc)
     file_time = now.strftime("%Y%j%H%M%S")
     gen_time = now.strftime("%Y-%j-%H:%M:%S")
 
