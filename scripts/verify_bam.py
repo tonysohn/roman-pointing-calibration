@@ -97,10 +97,10 @@ def main():
     print(f"V2Ref       : {v2_old:12.3f} | {v2_new:12.3f} | {(v2_new - v2_old):+10.3f} arcsec")
     print(f"V3Ref       : {v3_old:12.3f} | {v3_new:12.3f} | {(v3_new - v3_old):+10.3f} arcsec")
     print(f"V3IdlYAngle : {zeta_old:12.5f} | {zeta_new:12.5f} | {(zeta_new - zeta_old):+10.5f} deg")
-    print("--------------------------------------------------------")
+    print("-------------------------------------------------------------")
     print("SPATIAL SHIFT IMPLIED ON THE FOCAL PLANE:")
     print(f"{focal_plane_shift_arcsec:.2f} arcsec ({focal_plane_shift_arcmin:.2f} arcmin) ≃ {focal_plane_shift_pixels:.2f} WFI pixels")
-    print("========================================================\n")
+    print("=============================================================\n")
 
 if __name__ == "__main__":
     main()
