@@ -225,7 +225,7 @@ def generate_alignment_diagnostics(
         color="gray",
         s=80,
         linewidths=2,
-        label="WFI_CEN (Old)",
+        label="WFI_CEN (Pre-flight)",
     )
     ax_quiver.scatter(
         new_siaf["WFI_CEN"].V2Ref,

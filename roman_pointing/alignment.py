@@ -880,18 +880,62 @@ def align_wfi(
             calibrated_siaf_params["WFI_CEN"]["V3IdlYAngle"] - wfi_old.V3IdlYAngle
         )
 
+        # 1. Create the Body -> Sky attitude matrices for the old and new alignments
         M_old = pysiaf.utils.rotations.attitude(v2_wfi_old, v3_wfi_old, 0.0, 0.0, 0.0)
         M_new = pysiaf.utils.rotations.attitude(
             v2_wfi_new, v3_wfi_new, 0.0, 0.0, dtheta_deg
         )
 
-        cgi_vec_old = get_3d_vector(cgi_old.V2Ref, cgi_old.V3Ref)
+        # 2. Extract the pure 3D rigid body rotation delta (Body_new -> Body_old)
+        delta_R_matrix = np.dot(M_new.T, M_old)
 
-        cgi_vec_sky = np.dot(M_old, cgi_vec_old)
-        cgi_vec_new = np.dot(M_new.T, cgi_vec_sky)
+        # 3. Propagate the V2/V3 boresight physically in 3D
+        cgi_vec_old_body = get_3d_vector(cgi_old.V2Ref, cgi_old.V3Ref)
+        cgi_vec_new_body = np.dot(delta_R_matrix, cgi_vec_old_body)
+        v2_cgi_new, v3_cgi_new = get_v2v3_from_3d(cgi_vec_new_body)
 
-        v2_cgi_new, v3_cgi_new = get_v2v3_from_3d(cgi_vec_new)
-        angle_cgi_new = cgi_old.V3IdlYAngle + dtheta_deg
+        # 4. Propagate the Zeta Angle rigorously using the flight software Euler sequence
+        from scipy.spatial.transform import Rotation as R
+
+        # Reconstruct the pre-flight BAM quaternion using the old parameters
+        ya_rad = np.deg2rad(cgi_old.V3IdlYAngle)
+        bz_rad = np.deg2rad(cgi_old.V3Ref / 3600.0)
+        by_rad = np.deg2rad(cgi_old.V2Ref / 3600.0)
+
+        r1 = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, np.cos(ya_rad), -np.sin(ya_rad)],
+                [0.0, np.sin(ya_rad), np.cos(ya_rad)],
+            ]
+        )
+        r2 = np.array(
+            [
+                [np.cos(bz_rad), 0.0, np.sin(bz_rad)],
+                [0.0, 1.0, 0.0],
+                [-np.sin(bz_rad), 0.0, np.cos(bz_rad)],
+            ]
+        )
+        r3 = np.array(
+            [
+                [np.cos(by_rad), np.sin(by_rad), 0.0],
+                [-np.sin(by_rad), np.cos(by_rad), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        m_x2z = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
+
+        # Pre-flight CGI BAM
+        m_cgi2obs_old = (m_x2z @ r1 @ r2 @ r3).T
+        r_cgi_pre = R.from_matrix(m_cgi2obs_old)
+
+        # Apply the bulk 3D rotation to the quaternion
+        r_delta = R.from_matrix(delta_R_matrix)
+        r_cgi_predicted = r_delta * r_cgi_pre
+
+        # Extract the exact Euler 'ya' angle
+        a = m_x2z.T @ r_cgi_predicted.inv().as_matrix()
+        angle_cgi_new = np.rad2deg(np.arctan2(-a[1, 2], a[2, 2]))
 
         calibrated_siaf_params["CGI_CEN"] = {
             "V2Ref": v2_cgi_new,

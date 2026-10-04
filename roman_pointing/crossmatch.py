@@ -247,7 +247,7 @@ def project_catalog(
                 idx = 0
                 for d in range(6):
                     for y_deg in range(d + 1):
-                        mapping[idx] = f"{d - y_deg}{y_deg}"
+                        mapping[idx] = f"{d}{y_deg}"
                         idx += 1
 
                 for i in range(len(poly_coeffs["Sci2IdlX"])):

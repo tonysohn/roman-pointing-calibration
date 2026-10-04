@@ -10,6 +10,7 @@ Executes two sequential tasks:
                                 star catalogs.
 """
 
+import datetime
 import glob
 import os
 import warnings
@@ -121,6 +122,75 @@ def export_custom_siaf_yaml(
     with open(output_filename, "w") as f:
         f.write("\n".join(yaml_lines) + "\n")
     return output_filename
+
+
+def calculate_cgi_to_body_quaternion(
+    v2_ref: float, v3_ref: float, v3idlyangle: float
+) -> np.ndarray:
+    ya = np.deg2rad(v3idlyangle)
+    bz = np.deg2rad(v3_ref / 3600.0)
+    by = np.deg2rad(v2_ref / 3600.0)
+
+    r1 = np.array(
+        [[1.0, 0.0, 0.0], [0.0, np.cos(ya), -np.sin(ya)], [0.0, np.sin(ya), np.cos(ya)]]
+    )
+
+    r2 = np.array(
+        [[np.cos(bz), 0.0, np.sin(bz)], [0.0, 1.0, 0.0], [-np.sin(bz), 0.0, np.cos(bz)]]
+    )
+
+    r3 = np.array(
+        [[np.cos(by), np.sin(by), 0.0], [-np.sin(by), np.cos(by), 0.0], [0.0, 0.0, 1.0]]
+    )
+
+    m_x2z = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
+    m_obs2cgi = m_x2z @ r1 @ r2 @ r3
+    m_cgi2obs = m_obs2cgi.T
+
+    quat = R.from_matrix(m_cgi2obs).as_quat()
+
+    if quat[3] < 0:
+        quat = -quat
+
+    return quat
+
+
+def export_acs_bam_file(instrument, q_array, start_time_str, end_time_str):
+    """Exports strict ACS-compliant BAM text files."""
+    now = datetime.datetime.now()
+    file_time = now.strftime("%Y%j%H%M%S")
+    gen_time = now.strftime("%Y-%j-%H:%M:%S")
+
+    def reformat_time(t_str):
+        try:
+            t = Time(t_str).datetime
+            return t.strftime("%Y-%j-%H:%M:%S")
+        except Exception:
+            return t_str
+
+    timespan = f"{reformat_time(start_time_str)} - {reformat_time(end_time_str)}"
+    file_name = f"Roman_ACS_{instrument}_{file_time}"
+
+    lines = [
+        f"# File Name: {file_name}",
+        f"# Generated {gen_time}",
+        f"# Data Timespan: {timespan}",
+        f"# Body to {instrument} Alignment",
+        "# ",
+    ]
+
+    for i, val in enumerate(q_array, 1):
+        prefix = f"SCF_AC_{instrument}_TBL_Qb[{i}]"
+        # The formatting requires exactly 7 spaces for positive, 6 spaces for negative to align decimals
+        if val >= 0:
+            lines.append(f"{prefix}       {val:.17f}")
+        else:
+            lines.append(f"{prefix}      {val:.17f}")
+
+    with open(f"{file_name}.txt", "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    return f"{file_name}.txt"
 
 
 def main():
@@ -256,11 +326,13 @@ def main():
 
         try:
             obs_date_str = f.meta.exposure.start_time
+            obs_end_str = f.meta.exposure.end_time
         except AttributeError:
             print(
                 "Warning: Observation date missing from ASDF. Defaulting to 2026-09-20T00:00:00"
             )
             obs_date_str = "2026-09-20T00:00:00"
+            obs_end_str = "2026-09-20T00:00:00"
 
     pointing_info = {"RA_V1": ra_v1, "DEC_V1": dec_v1, "PA_V3": pa_v3}
     print(
@@ -277,7 +349,7 @@ def main():
     )
 
     try:
-        cat_file = "local_gaia_catalog.ecsv"
+        cat_file = "gaia_dr3_commissioning_field_wide.ecsv"
         print(f"  -> Loading reference catalog: {cat_file}")
         ref_catalog = Table.read(cat_file, format="ascii.ecsv")
 
@@ -409,6 +481,12 @@ def main():
             wfi_cen_aper=roman_siaf["WFI_CEN"],
             q_b2fgs_old=q_b2fgs_preflight,
         )
+
+        # --- EXPORT FGS BAM ---
+        fgs_bam_file = export_acs_bam_file(
+            "FGS", q_b2fgs_calibrated, obs_date_str, obs_end_str
+        )
+
         print("\n========================================================")
         print("           FGS BORESIGHT CALIBRATION RESULTS             ")
         print("========================================================")
@@ -416,6 +494,7 @@ def main():
         print(
             f"[{q_b2fgs_calibrated[0]:.17f}, {q_b2fgs_calibrated[1]:.17f}, {q_b2fgs_calibrated[2]:.17f}, {q_b2fgs_calibrated[3]:.17f}]"
         )
+        print(f"Exported FGS BAM file: {fgs_bam_file}")
 
         q_nom = R.from_quat(q_b2fgs_preflight)
         q_cal = R.from_quat(q_b2fgs_calibrated)
@@ -578,6 +657,13 @@ def main():
         print(
             f"Updated CGI_CEN -> V2Ref: {v2_cgi_new:.3f}, V3Ref: {v3_cgi_new:.3f}, Angle: {angle_cgi_new:.5f}"
         )
+
+        # --- EXPORT CGI BAM ---
+        q_b2cgi = calculate_cgi_to_body_quaternion(
+            v2_cgi_new, v3_cgi_new, angle_cgi_new
+        )
+        cgi_bam_file = export_acs_bam_file("CGI", q_b2cgi, obs_date_str, obs_end_str)
+        print(f"Exported CGI BAM file: {cgi_bam_file}")
 
     output_yaml = export_custom_siaf_yaml(
         calibrated_siaf_params=calibrated_siaf_params,

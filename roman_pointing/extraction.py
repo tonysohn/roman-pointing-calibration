@@ -17,6 +17,7 @@ from photutils.detection import DAOStarFinder, IRAFStarFinder
 from photutils.psf import GriddedPSFModel, IterativePSFPhotometry
 
 warnings.filterwarnings("ignore", message=".*Input data contains invalid values.*")
+warnings.filterwarnings("ignore", message=".*Input data contains non-finite values.*")
 
 
 def load_phot_config(config_path="car086_phot_config.json"):
@@ -28,11 +29,11 @@ def load_phot_config(config_path="car086_phot_config.json"):
     else:
         print("Config not found. Using pre-flight nominal parameters.")
         return {
-            "sigma_threshold": 50.0,
+            "sigma_threshold": 20.0,
             "fwhm": 1.5,
-            "sharp_lo": 0.85,
-            "sharp_hi": 1.25,
-            "round_hi": 0.45,
+            "sharp_lo": 0.7,
+            "sharp_hi": 1.3,
+            "round_hi": 0.6,
             "min_flux": 100.0,
         }
 
@@ -58,17 +59,27 @@ def _extract_with_gaussian(data_es, bkg_val, std_val):
 
     if sources is None or len(sources) == 0:
         return Table(
-            names=("x_centroid", "y_centroid", "flux", "sharpness", "roundness"),
+            names=("x", "y", "flux", "sharpness", "roundness"),
             dtype=("f8", "f8", "f8", "f8", "f8"),
         )
 
-    # 3. Morphological cuts (Flux cut)
-    mask = sources["flux"] > cfg["min_flux"]
+    # 3. Morphological cuts (Flux cut AND Edge Filtering)
+    box_size = 5
+    margin = (box_size // 2) + 1
+    ny, nx = data_es.shape
+
+    mask = (
+        (sources["flux"] > cfg["min_flux"])
+        & (sources["x_centroid"] > margin)
+        & (sources["x_centroid"] < nx - margin)
+        & (sources["y_centroid"] > margin)
+        & (sources["y_centroid"] < ny - margin)
+    )
     sources_masked = sources[mask]
 
     if len(sources_masked) == 0:
         return Table(
-            names=("x_centroid", "y_centroid", "flux", "sharpness", "roundness"),
+            names=("x", "y", "flux", "sharpness", "roundness"),
             dtype=("f8", "f8", "f8", "f8", "f8"),
         )
 
@@ -79,7 +90,7 @@ def _extract_with_gaussian(data_es, bkg_val, std_val):
     sharpness_raw = sources_masked["sharpness"]
     roundness_raw = sources_masked["roundness"]
 
-    # 4. Precision centroiding
+    # 4. Precision centroiding (Safe from out-of-bounds errors)
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -88,7 +99,7 @@ def _extract_with_gaussian(data_es, bkg_val, std_val):
             module="photutils.centroids.gaussian",
         )
         xarr_fit, yarr_fit = centroid_sources(
-            data_es, xarr_raw, yarr_raw, box_size=5, centroid_func=centroid_2dg
+            data_es, xarr_raw, yarr_raw, box_size=box_size, centroid_func=centroid_2dg
         )
 
     # Return exactly matching the pipeline standard with new morphological columns
