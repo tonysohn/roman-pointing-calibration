@@ -154,6 +154,16 @@ def calculate_cgi_to_body_quaternion(
     return quat
 
 
+def extract_euler_ya(q_array):
+    """Extracts the exact Euler 'ya' (zeta/roll) angle from an ACS BAM quaternion."""
+    m_x2z = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
+    q = np.asarray(q_array, dtype=float)
+    q /= np.linalg.norm(q)
+    m_b2fgs = R.from_quat(q).inv().as_matrix()
+    a = m_x2z.T @ m_b2fgs
+    return np.rad2deg(np.arctan2(-a[1, 2], a[2, 2]))
+
+
 def export_acs_bam_file(instrument, q_array, start_time_str, end_time_str):
     """Exports strict ACS-compliant BAM text files with UTC timestamps."""
     # Enforce UTC time for the BAM export
@@ -349,7 +359,7 @@ def main():
     )
 
     try:
-        cat_file = "gaia_dr3_commissioning_field_wide.ecsv"
+        cat_file = "local_gaia_catalog.ecsv"
         print(f"  -> Loading reference catalog: {cat_file}")
         ref_catalog = Table.read(cat_file, format="ascii.ecsv")
 
@@ -536,14 +546,6 @@ def main():
             f"BAM-Derived WFI_CEN -> V2: {hw_v2:.3f}, V3: {hw_v3:.3f}, Angle: {hw_angle:.5f}"
         )
 
-        m_b2fgs_nom = R.from_quat(q_b2fgs_preflight).inv().as_matrix()
-        a_nom = m_x2z.T @ m_b2fgs_nom
-        ya_nom_rad = np.arctan2(-a_nom[1, 2], a_nom[2, 2])
-        hw_angle_nom = np.rad2deg(ya_nom_rad)
-        hw_angle_nom -= 180.0
-        hw_angle_nom = (hw_angle_nom + 180.0) % 360.0 - 180.0
-        delta_hw_angle = hw_angle - hw_angle_nom
-
     except Exception as e:
         print(f"FGS Boresight Calibration failed: {e}")
 
@@ -624,6 +626,7 @@ def main():
         cgi_old = pristine_siaf["CGI_CEN"]
         wfi_old = pristine_siaf["WFI_CEN"]
 
+        # 1. Propagate Absolute Boresight Position
         v2_wfi_old, v3_wfi_old = wfi_old.V2Ref, wfi_old.V3Ref
         v2_wfi_new, v3_wfi_new = bam_v2, bam_v3
 
@@ -647,7 +650,31 @@ def main():
 
         v2_cgi_new = np.rad2deg(np.arctan2(cgi_vec_new[1], cgi_vec_new[0])) * 3600.0
         v3_cgi_new = np.rad2deg(np.arcsin(cgi_vec_new[2])) * 3600.0
-        angle_cgi_new = cgi_old.V3IdlYAngle + dAngle_bulk
+
+        # 2. Extract Exact 3D Structural Zeta (Roll)
+        try:
+            r_fgs_old = R.from_quat(q_b2fgs_preflight)
+            r_fgs_new = R.from_quat(q_b2fgs_calibrated)
+
+            # Ground PRD Baseline CGI Quaternion
+            q_cgi_preflight = np.array(
+                [
+                    0.614506283622662,
+                    0.35231710498179736,
+                    0.610231126204051,
+                    0.3547853682682605,
+                ]
+            )
+            r_cgi_pre = R.from_quat(q_cgi_preflight)
+
+            r_delta = r_fgs_new * r_fgs_old.inv()
+            r_cgi_predicted = r_delta * r_cgi_pre
+
+            angle_cgi_new = extract_euler_ya(r_cgi_predicted.as_quat())
+            angle_cgi_new = (angle_cgi_new + 180.0) % 360.0 - 180.0
+        except NameError:
+            # Fallback if FGS calibration failed upstream
+            angle_cgi_new = cgi_old.V3IdlYAngle + dAngle_bulk
 
         calibrated_siaf_params["CGI_CEN"] = {
             "V2Ref": v2_cgi_new,

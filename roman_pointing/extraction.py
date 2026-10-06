@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore", message=".*Input data contains invalid values.
 warnings.filterwarnings("ignore", message=".*Input data contains non-finite values.*")
 
 
-def load_phot_config(config_path="car086_phot_config.json"):
+def load_phot_config(config_path="phot_config.json"):
     """Loads tuning parameters, falling back to nominal defaults if missing."""
     if os.path.exists(config_path):
         with open(config_path, "r") as f:

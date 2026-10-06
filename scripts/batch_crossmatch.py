@@ -167,7 +167,7 @@ def main():
             f"\nBOOTSTRAP MODE ENABLED: Projecting with calibrated models from {args.siaf}"
         )
 
-    gaia_file = "gaia_dr3_commissioning_field_wide.ecsv"
+    gaia_file = "local_gaia_catalog.ecsv"
     print(f"Loading reference catalog: {gaia_file}")
     ref_catalog = Table.read(gaia_file, format="ascii.ecsv")
 
