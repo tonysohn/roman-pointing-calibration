@@ -48,6 +48,11 @@ FIT_DEGREE = 5
 # Only turn it off if spacecraft velocities are missing or corrupted.
 APPLY_DVA = True
 
+# --- CGI CALIBRATION TOGGLE ---
+# Set to False to skip CGI_CEN propagation and CGI BAM export if you are
+# running run_cgi_alignment_calibration.py separately.
+CALIBRATE_CGI = False
+
 # --- MANUAL TELEMETRY OVERRIDES ---
 # Set to a float to override pipeline metadata, or None to read from ASDF.
 MANUAL_RA_V1 = None
@@ -60,7 +65,7 @@ MANUAL_VZ_KMS = None
 
 # Set to a list/tuple of 4 floats to override qbj, or None to calculate from pointing.
 # Example: MANUAL_QBJ = [0.70515723, 0.08269192, -0.68259625, -0.17314064]
-MANUAL_QBJ = None
+MANUAL_QBJ = None  # [0.724513378776, 0.245519258582, -0.644039425415, 0.003724447384]
 
 # --- CUSTOM SIAF TOGGLE ---
 CUSTOM_SIAF_PATH = None  # Use this only when testing. Otherwise, start from PRD SIAF.
@@ -622,7 +627,7 @@ def main():
         "V3IdlYAngle": bam_angle,
     }
 
-    if "CGI_CEN" in pristine_siaf.apertures:
+    if CALIBRATE_CGI and "CGI_CEN" in pristine_siaf.apertures:
         cgi_old = pristine_siaf["CGI_CEN"]
         wfi_old = pristine_siaf["WFI_CEN"]
 
@@ -691,6 +696,18 @@ def main():
         )
         cgi_bam_file = export_acs_bam_file("CGI", q_b2cgi, obs_date_str, obs_end_str)
         print(f"Exported CGI BAM file: {cgi_bam_file}")
+
+    elif not CALIBRATE_CGI:
+        print("\nSkipping CGI_CEN calibration (CALIBRATE_CGI = False).")
+        calibrated_siaf_params.pop("CGI_CEN", None)
+
+    print("\n========================================================")
+    print("   TRUE CELESTIAL COORDINATES RECOVERED FOR V1 BORESIGHT")
+    print("========================================================")
+    print(f"SOLVED_WFI_RA_V1  = {attitude_results['RA_V1']:.8f}")
+    print(f"SOLVED_WFI_DEC_V1 = {attitude_results['DEC_V1']:.8f}")
+    print(f"SOLVED_WFI_PA_V3  = {attitude_results['PA_V3']:.8f}")
+    print("========================================================\n")
 
     output_yaml = export_custom_siaf_yaml(
         calibrated_siaf_params=calibrated_siaf_params,
