@@ -30,6 +30,7 @@ def process_single_detector(
     siaf_file=None,
     dV2=0.0,
     dV3=0.0,
+    use_gwcs=False,
 ):
     """Isolated worker function executing a seeded fine-match on a dedicated CPU core."""
     basename = os.path.basename(asdf_path)
@@ -59,7 +60,7 @@ def process_single_detector(
         ]
     )
     try:
-        # Unified PySIAF projection supporting XML and YAML
+        # Unified projection supporting PySIAF (XML/YAML) and native gWCS
         sub_cat, pred_pixels = project_catalog(
             asdf_path,
             ref_catalog,
@@ -67,6 +68,7 @@ def process_single_detector(
             custom_siaf_filepath=siaf_file,
             dV2=dV2,
             dV3=dV3,
+            use_gwcs=use_gwcs,
         )
 
         seeded_config = dataclasses.replace(config, window_padding_pix=400.0)
@@ -149,16 +151,25 @@ def process_single_detector(
 
 
 def main():
-    import argparse
-
     parser = argparse.ArgumentParser(description="Robust Cross-Matcher for Roman WFI")
     parser.add_argument(
         "--siaf", type=str, default=None, help="Path to calibrated SIAF (.xml or .yml)"
     )
+    parser.add_argument(
+        "--gwcs",
+        action="store_true",
+        help="Use gWCS embedded in ASDF instead of PySIAF",
+    )
     args = parser.parse_args()
 
     print("--- Robust SIAF Cross-Match Pipeline (Parallelized) ---")
-    if args.siaf:
+    if args.gwcs:
+        print(
+            "\nGWCS MODE ENABLED: Bypassing PySIAF. Projecting catalogs using embedded Level-2 ASDF gWCS."
+        )
+        if args.siaf:
+            print("  [WARNING] --siaf flag ignored because --gwcs is active.")
+    elif args.siaf:
         if not os.path.exists(args.siaf):
             raise FileNotFoundError(
                 f"CRITICAL: Bootstrap SIAF not found at '{args.siaf}'."
@@ -205,7 +216,6 @@ def main():
         ]
     )
 
-    # Project the scout using the user-provided SIAF XML/YAML (if available)
     _, scout_pred_pixels = project_catalog(
         scout_file,
         ref_catalog,
@@ -213,6 +223,7 @@ def main():
         custom_siaf_filepath=args.siaf,
         dV2=0.0,
         dV3=0.0,
+        use_gwcs=args.gwcs,
     )
 
     _, _, scout_affine = find_detector_consensus_matches(
@@ -237,9 +248,16 @@ def main():
     dV3 = v3_shift - v3_cen
     print(f"Global V2/V3 correction locked: dV2={dV2:.3f}, dV3={dV3:.3f} arcsec.")
 
-    global_seed = np.array([0.0, 0.0]) if args.siaf else np.array([dx_pix, dy_pix])
-    passed_dV2 = dV2 if args.siaf else 0.0
-    passed_dV3 = dV3 if args.siaf else 0.0
+    # Apply the native pixel shift as a global search offset for all worker chips
+    global_seed = (
+        np.array([dx_pix, dy_pix])
+        if args.gwcs
+        else (np.array([0.0, 0.0]) if args.siaf else np.array([dx_pix, dy_pix]))
+    )
+
+    # We zero out dV2/dV3 for gWCS since it natively solves via detector pixel offsets
+    passed_dV2 = 0.0 if args.gwcs else (dV2 if args.siaf else 0.0)
+    passed_dV3 = 0.0 if args.gwcs else (dV3 if args.siaf else 0.0)
 
     print(f"\nDispatching {len(asdf_files)} SCAs to worker pool (4 at a time)")
     print(f"============================================================")
@@ -260,6 +278,7 @@ def main():
                 args.siaf,
                 passed_dV2,
                 passed_dV3,
+                args.gwcs,
             ): asdf_path
             for asdf_path in asdf_files
         }

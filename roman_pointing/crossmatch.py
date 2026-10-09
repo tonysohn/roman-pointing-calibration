@@ -191,16 +191,15 @@ def project_catalog(
     custom_siaf_filepath=None,
     dV2=0.0,
     dV3=0.0,
+    use_gwcs=False,
 ):
-    """Projects Gaia sources entirely using PySIAF, accepting XML or YAML overrides, falling back to PRD."""
+    """Projects Gaia sources using either ASDF gWCS natively, or PySIAF with XML/YAML overrides."""
     import os
     import warnings
 
     import asdf
     import astropy.units as u
     import numpy as np
-    import pysiaf
-    import yaml
     from astropy.coordinates import SkyCoord
     from astropy.time import Time
 
@@ -212,70 +211,13 @@ def project_catalog(
             ra_v1 = f["roman"]["meta"]["pointing"]["ra_v1"]
             dec_v1 = f["roman"]["meta"]["pointing"]["dec_v1"]
             pa_v3 = f["roman"]["meta"]["pointing"]["pa_v3"]
+            wcs_obj = f["roman"]["meta"].get("wcs", None)
 
     basename = os.path.basename(asdf_filepath)
     det = next(
         (p for p in basename.upper().split("_") if p.startswith("WFI") and len(p) == 5),
         None,
     )
-    sca_key = f"{det}_FULL"
-
-    # Start with the baseline PRD SIAF
-    rsiaf = pysiaf.Siaf("Roman")
-    aper = rsiaf[sca_key]
-
-    if custom_siaf_filepath and os.path.exists(custom_siaf_filepath):
-        if custom_siaf_filepath.lower().endswith(".xml"):
-            base_dir = os.path.dirname(os.path.abspath(custom_siaf_filepath))
-            file_name = os.path.basename(custom_siaf_filepath)
-            custom_siaf = pysiaf.Siaf("Roman", basepath=base_dir, filename=file_name)
-            if sca_key in custom_siaf.apertures:
-                aper = custom_siaf[sca_key]
-
-        elif custom_siaf_filepath.lower().endswith((".yml", ".yaml")):
-            with open(custom_siaf_filepath, "r") as yf:
-                cal_data = yaml.safe_load(yf)
-
-            if sca_key in cal_data:
-                params = cal_data[sca_key]
-                aper.V2Ref = params["V2Ref"]
-                aper.V3Ref = params["V3Ref"]
-                aper.V3IdlYAngle = params["V3IdlYAngle"]
-
-                poly_coeffs = aper.get_polynomial_coefficients()
-                mapping = {}
-                idx = 0
-                for d in range(6):
-                    for y_deg in range(d + 1):
-                        mapping[idx] = f"{d}{y_deg}"
-                        idx += 1
-
-                for i in range(len(poly_coeffs["Sci2IdlX"])):
-                    suffix = mapping[i]
-                    if f"Sci2IdlX{suffix}" in params:
-                        poly_coeffs["Sci2IdlX"][i] = params[f"Sci2IdlX{suffix}"]
-                        poly_coeffs["Sci2IdlY"][i] = params[f"Sci2IdlY{suffix}"]
-                        poly_coeffs["Idl2SciX"][i] = params[f"Idl2SciX{suffix}"]
-                        poly_coeffs["Idl2SciY"][i] = params[f"Idl2SciY{suffix}"]
-
-                lower_poly_coeffs = {k.lower(): v for k, v in poly_coeffs.items()}
-                aper.set_polynomial_coefficients(**lower_poly_coeffs)
-        else:
-            print(
-                f"\n  [WARNING] Unsupported SIAF format: {custom_siaf_filepath}. Using default PRD SIAF."
-            )
-    else:
-        if custom_siaf_filepath:
-            print(
-                f"\n  [WARNING] Provided SIAF file not found: {custom_siaf_filepath}. Using default PRD."
-            )
-        else:
-            print(
-                f"\n  [WARNING] No calibrated SIAF provided for {det}. Using default PRD SIAF."
-            )
-            print(
-                f"            If the cross-match fails due to large offsets, consider reverting to gWCS."
-            )
 
     ra_col = "ra_epoch" if "ra_epoch" in reference_catalog.colnames else "ra"
     dec_col = "dec_epoch" if "dec_epoch" in reference_catalog.colnames else "dec"
@@ -295,14 +237,86 @@ def project_catalog(
     prop_ra = propagated_sky.ra.deg
     prop_dec = propagated_sky.dec.deg
 
-    att = pysiaf.utils.rotations.attitude(0, 0, ra_v1, dec_v1, pa_v3)
-    v2, v3 = pysiaf.utils.rotations.getv2v3(att, prop_ra, prop_dec)
+    if use_gwcs:
+        if wcs_obj is None:
+            raise ValueError(f"CRITICAL: No gWCS object found inside {asdf_filepath}")
 
-    v2 += dV2
-    v3 += dV3
+        print(f"  [INFO] Projecting {det} natively using ASDF embedded gWCS.")
+        # Fix: astropy high-level API expects a single SkyCoord object for the celestial frame
+        pixel_x, pixel_y = wcs_obj.world_to_pixel(propagated_sky)
 
-    pixel_x, pixel_y = aper.tel_to_sci(v2, v3)
+    else:
+        import pysiaf
+        import yaml
 
+        sca_key = f"{det}_FULL"
+        rsiaf = pysiaf.Siaf("Roman")
+        aper = rsiaf[sca_key]
+
+        if custom_siaf_filepath and os.path.exists(custom_siaf_filepath):
+            if custom_siaf_filepath.lower().endswith(".xml"):
+                base_dir = os.path.dirname(os.path.abspath(custom_siaf_filepath))
+                file_name = os.path.basename(custom_siaf_filepath)
+                custom_siaf = pysiaf.Siaf(
+                    "Roman", basepath=base_dir, filename=file_name
+                )
+                if sca_key in custom_siaf.apertures:
+                    aper = custom_siaf[sca_key]
+
+            elif custom_siaf_filepath.lower().endswith((".yml", ".yaml")):
+                with open(custom_siaf_filepath, "r") as yf:
+                    cal_data = yaml.safe_load(yf)
+
+                if sca_key in cal_data:
+                    params = cal_data[sca_key]
+                    aper.V2Ref = params["V2Ref"]
+                    aper.V3Ref = params["V3Ref"]
+                    aper.V3IdlYAngle = params["V3IdlYAngle"]
+
+                    poly_coeffs = aper.get_polynomial_coefficients()
+                    mapping = {}
+                    idx = 0
+                    for d in range(6):
+                        for y_deg in range(d + 1):
+                            mapping[idx] = f"{d}{y_deg}"
+                            idx += 1
+
+                    for i in range(len(poly_coeffs["Sci2IdlX"])):
+                        suffix = mapping[i]
+                        if f"Sci2IdlX{suffix}" in params:
+                            poly_coeffs["Sci2IdlX"][i] = params[f"Sci2IdlX{suffix}"]
+                            poly_coeffs["Sci2IdlY"][i] = params[f"Sci2IdlY{suffix}"]
+                            poly_coeffs["Idl2SciX"][i] = params[f"Idl2SciX{suffix}"]
+                            poly_coeffs["Idl2SciY"][i] = params[f"Idl2SciY{suffix}"]
+
+                    lower_poly_coeffs = {k.lower(): v for k, v in poly_coeffs.items()}
+                    aper.set_polynomial_coefficients(**lower_poly_coeffs)
+            else:
+                print(
+                    f"\n  [WARNING] Unsupported SIAF format: {custom_siaf_filepath}. Using default PRD SIAF."
+                )
+        else:
+            if custom_siaf_filepath:
+                print(
+                    f"\n  [WARNING] Provided SIAF file not found: {custom_siaf_filepath}. Using default PRD."
+                )
+            else:
+                print(
+                    f"\n  [WARNING] No calibrated SIAF provided for {det}. Using default PRD SIAF."
+                )
+                print(
+                    f"            If the cross-match fails due to large offsets, consider reverting to gWCS."
+                )
+
+        att = pysiaf.utils.rotations.attitude(0, 0, ra_v1, dec_v1, pa_v3)
+        v2, v3 = pysiaf.utils.rotations.getv2v3(att, prop_ra, prop_dec)
+
+        v2 += dV2
+        v3 += dV3
+
+        pixel_x, pixel_y = aper.tel_to_sci(v2, v3)
+
+    # Filter bounds
     valid_pixels = np.isfinite(pixel_x) & np.isfinite(pixel_y)
     pixel_x = pixel_x[valid_pixels]
     pixel_y = pixel_y[valid_pixels]
@@ -320,8 +334,6 @@ def project_catalog(
     )
 
     final_catalog = filtered_catalog[in_bounds]
-
-    # PySIAF tel_to_sci outputs 1-based pixels natively. Do not add + 1.
     predicted_pixels = np.column_stack([pixel_x[in_bounds], pixel_y[in_bounds]])
 
     final_catalog["ra_epoch"] = prop_ra[in_bounds]

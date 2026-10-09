@@ -38,6 +38,11 @@ def main():
         "--siaf", type=str, default=None, help="Optional YAML/XML SIAF to apply."
     )
     parser.add_argument(
+        "--gwcs",
+        action="store_true",
+        help="Use gWCS embedded in ASDF instead of PySIAF",
+    )
+    parser.add_argument(
         "--target_dir",
         type=str,
         default="crossmatch_results",
@@ -57,6 +62,17 @@ def main():
     print(f"ASDF File : {basename}")
     print(f"Extracted : {os.path.basename(args.extracted_catalog)}")
     print(f"Reference : {os.path.basename(args.reference_catalog)}")
+
+    if args.gwcs:
+        print(
+            "\nGWCS MODE ENABLED: Bypassing PySIAF. Projecting catalogs using embedded Level-2 ASDF gWCS."
+        )
+        if args.siaf:
+            print("  [WARNING] --siaf flag ignored because --gwcs is active.")
+    elif args.siaf:
+        print(
+            f"\nBOOTSTRAP MODE ENABLED: Projecting with calibrated models from {args.siaf}"
+        )
 
     os.makedirs(args.target_dir, exist_ok=True)
 
@@ -79,7 +95,11 @@ def main():
     print("Projecting reference catalog to detector space...")
     config = RobustMatchConfig()
     projected_cat, pred_coords = project_catalog(
-        args.asdf_file, ref_cat, config=config, custom_siaf_filepath=args.siaf
+        args.asdf_file,
+        ref_cat,
+        config=config,
+        custom_siaf_filepath=args.siaf,
+        use_gwcs=args.gwcs,
     )
 
     if len(pred_coords) < config.min_total_matches:
