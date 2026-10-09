@@ -241,7 +241,7 @@ def project_catalog(
         if wcs_obj is None:
             raise ValueError(f"CRITICAL: No gWCS object found inside {asdf_filepath}")
 
-        print(f"  [INFO] Projecting {det} natively using ASDF embedded gWCS.")
+        # print(f"  [INFO] Projecting {det} natively using ASDF embedded gWCS.")
         # Fix: astropy high-level API expects a single SkyCoord object for the celestial frame
         pixel_x, pixel_y = wcs_obj.world_to_pixel(propagated_sky)
 
