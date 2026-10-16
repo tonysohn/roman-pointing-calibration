@@ -10,6 +10,7 @@ Executes two sequential tasks:
                                 star catalogs.
 """
 
+import argparse
 import datetime
 import glob
 import os
@@ -48,24 +49,10 @@ FIT_DEGREE = 5
 # Only turn it off if spacecraft velocities are missing or corrupted.
 APPLY_DVA = True
 
-# --- CGI CALIBRATION TOGGLE ---
-# Set to False to skip CGI_CEN propagation and CGI BAM export if you are
-# running run_cgi_alignment_calibration.py separately.
-CALIBRATE_CGI = False
-
-# --- MANUAL TELEMETRY OVERRIDES ---
-# Set to a float to override pipeline metadata, or None to read from ASDF.
+# --- MANUAL TELEMETRY OVERRIDES (Defaults if not provided via CLI) ---
 MANUAL_RA_V1 = None
 MANUAL_DEC_V1 = None
 MANUAL_PA_V3 = None
-
-MANUAL_VX_KMS = None
-MANUAL_VY_KMS = None
-MANUAL_VZ_KMS = None
-
-# Set to a list/tuple of 4 floats to override qbj, or None to calculate from pointing.
-# Example: MANUAL_QBJ = [0.70515723, 0.08269192, -0.68259625, -0.17314064]
-MANUAL_QBJ = None  # [0.724513378776, 0.245519258582, -0.644039425415, 0.003724447384]
 
 # --- CUSTOM SIAF TOGGLE ---
 CUSTOM_SIAF_PATH = None  # Use this only when testing. Otherwise, start from PRD SIAF.
@@ -196,7 +183,6 @@ def export_acs_bam_file(instrument, q_array, start_time_str, end_time_str):
 
     for i, val in enumerate(q_array, 1):
         prefix = f"SCF_AC_{instrument}_TBL_Qb[{i}]"
-        # The formatting requires exactly 7 spaces for positive, 6 spaces for negative to align decimals
         if val >= 0:
             lines.append(f"{prefix}       {val:.17f}")
         else:
@@ -209,20 +195,71 @@ def export_acs_bam_file(instrument, q_array, start_time_str, end_time_str):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Roman Pointing Calibration Workflow")
+    parser.add_argument(
+        "--qbj",
+        type=float,
+        nargs=4,
+        metavar=("QX", "QY", "QZ", "QW"),
+        default=None,
+        help="Override telemetry quaternion (e.g., ST-based SCF_AC_EST_STGE_QBJ)",
+    )
+    parser.add_argument(
+        "--calibrate-cgi",
+        action="store_true",
+        help="Enable CGI calibration propagation and BAM export",
+    )
+    parser.add_argument(
+        "--sc_vel",
+        type=float,
+        nargs=3,
+        metavar=("VX", "VY", "VZ"),
+        help="Spacecraft Velocity (km/s) as VX VY VZ",
+    )
+    parser.add_argument(
+        "--fit-degree",
+        type=int,
+        default=5,
+        help="Alignment polynomial degree (5 for full 5th-order, 1 for affine)",
+    )
+    parser.add_argument(
+        "--dva",
+        "--apply-dva",
+        dest="apply_dva",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable/disable Differential Velocity Aberration correction (default: enabled)",
+    )
+    parser.add_argument(
+        "--crossmatch-dir",
+        type=str,
+        default="crossmatch_results",
+        help="Crossmatch input directory",
+    )
+    parser.add_argument(
+        "--custom-siaf-path",
+        type=str,
+        help="Custom SIAF path to use for testing",
+    )
+    args = parser.parse_args()
+
+    # Handle DVA flag
+    apply_dva = args.apply_dva
+
     print("--- 1. DATA INGEST ---")
 
-    if CUSTOM_SIAF_PATH and os.path.exists(CUSTOM_SIAF_PATH):
-        base_dir = os.path.dirname(os.path.abspath(CUSTOM_SIAF_PATH))
-        file_name = os.path.basename(CUSTOM_SIAF_PATH)
+    if args.custom_siaf_path and os.path.exists(args.custom_siaf_path):
+        base_dir = os.path.dirname(os.path.abspath(args.custom_siaf_path))
+        file_name = os.path.basename(args.custom_siaf_path)
         roman_siaf = pysiaf.Siaf("Roman", basepath=base_dir, filename=file_name)
         pristine_siaf = pysiaf.Siaf("Roman", basepath=base_dir, filename=file_name)
-        print(f"Loaded custom SIAF from: {CUSTOM_SIAF_PATH}")
+        print(f"Loaded custom SIAF from: {args.custom_siaf_path}")
     else:
         roman_siaf = pysiaf.Siaf("Roman")
         pristine_siaf = pysiaf.Siaf("Roman")
         print("Loaded default PRD SIAF via pysiaf.")
 
-    ecsv_files = sorted(glob.glob("*_wfi??_f146_cal.asdf_catalog.ecsv"))
+    ecsv_files = sorted(glob.glob("*_wfi??_f???_cal.asdf_catalog.ecsv"))
     print(f"Found {len(ecsv_files)} extracted catalogs to align.")
 
     if not ecsv_files:
@@ -270,7 +307,7 @@ def main():
         f"  -> Filtered all observed SCA catalogs to the brightest {max_observed_stars} sources per chip."
     )
 
-    original_asdfs = glob.glob("*_wfi??_f146_cal.asdf")
+    original_asdfs = glob.glob("*_wfi??_f???_cal.asdf")
     if not original_asdfs:
         print("Error: No original ASDF files found. Cannot extract pointing metadata.")
         return
@@ -280,10 +317,10 @@ def main():
 
     with rdm.open(original_asdf) as f:
         try:
-            if MANUAL_QBJ is not None:
-                acs_telemetry_qbj = np.array(MANUAL_QBJ)
+            if args.qbj is not None:
+                acs_telemetry_qbj = np.array(args.qbj)
                 print(
-                    "  -> Using MANUAL OVERRIDE for Telemetry Quaternion (SCF_AC_SDR_QBJ)."
+                    "  -> Using MANUAL OVERRIDE for Telemetry Quaternion (e.g. ST-based)."
                 )
             else:
                 q_obj = f.meta.pointing.quaternion
@@ -298,9 +335,6 @@ def main():
             ra_v1, dec_v1 = pysiaf.utils.rotations.pointing(r_att.as_matrix(), 0, 0)
             pa_v3 = pysiaf.utils.rotations.posangle(r_att.as_matrix(), 0, 0)
 
-            ra_v1 = MANUAL_RA_V1 if MANUAL_RA_V1 is not None else ra_v1
-            dec_v1 = MANUAL_DEC_V1 if MANUAL_DEC_V1 is not None else dec_v1
-            pa_v3 = MANUAL_PA_V3 if MANUAL_PA_V3 is not None else pa_v3
         except AttributeError as e:
             print(f"Error: Pointing quaternion metadata missing from ASDF: {e}")
             return
@@ -317,22 +351,14 @@ def main():
             )
 
         try:
-            v_x = (
-                MANUAL_VX_KMS
-                if MANUAL_VX_KMS is not None
-                else f.meta.ephemeris.velocity_x
-            )
-            v_y = (
-                MANUAL_VY_KMS
-                if MANUAL_VY_KMS is not None
-                else f.meta.ephemeris.velocity_y
-            )
-            v_z = (
-                MANUAL_VZ_KMS
-                if MANUAL_VZ_KMS is not None
-                else f.meta.ephemeris.velocity_z
-            )
-            velocity_kms = np.array([v_x, v_y, v_z])
+            if args.sc_vel is not None:
+                v_x, v_y, v_z = args.sc_vel
+                velocity_kms = np.array([v_x, v_y, v_z])
+            else:
+                v_x = f.meta.ephemeris.velocity_x
+                v_y = f.meta.ephemeris.velocity_y
+                v_z = f.meta.ephemeris.velocity_z
+                velocity_kms = np.array([v_x, v_y, v_z])
         except AttributeError:
             print(
                 "Error: Spacecraft velocity missing from ASDF meta and no manual override provided."
@@ -401,7 +427,7 @@ def main():
             f"  -> Filtered reference catalog: {len(ref_catalog)} stars with {mag_bright} < G <= {mag_faint}"
         )
 
-        if APPLY_DVA and has_dva_meta:
+        if apply_dva and has_dva_meta:
             print("  -> Applying Differential Velocity Aberration (DVA) to Gaia...")
             app_ra, app_dec = apply_dva_scale_to_catalog(
                 np.asarray(ref_catalog["ra_epoch"]),
@@ -427,8 +453,8 @@ def main():
         debug=False,
         target_wfi_cen=None,
         roman_siaf=roman_siaf,
-        fit_degree=FIT_DEGREE,
-        precomputed_matches_dir=CROSSMATCH_DIR,
+        fit_degree=args.fit_degree,
+        precomputed_matches_dir=args.crossmatch_dir,
     )
 
     mean_dec_rad = np.deg2rad(attitude_results["DEC_V1"])
@@ -526,13 +552,7 @@ def main():
 
         m_b2fgs = R.from_quat(q_b2fgs_calibrated).inv().as_matrix()
 
-        m_x2z = np.array(
-            [
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-                [1.0, 0.0, 0.0],
-            ]
-        )
+        m_x2z = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
         a = m_x2z.T @ m_b2fgs
 
         bz_rad = np.arcsin(np.clip(a[0, 2], -1.0, 1.0))
@@ -627,11 +647,10 @@ def main():
         "V3IdlYAngle": bam_angle,
     }
 
-    if CALIBRATE_CGI and "CGI_CEN" in pristine_siaf.apertures:
+    if args.calibrate_cgi and "CGI_CEN" in pristine_siaf.apertures:
         cgi_old = pristine_siaf["CGI_CEN"]
         wfi_old = pristine_siaf["WFI_CEN"]
 
-        # 1. Propagate Absolute Boresight Position
         v2_wfi_old, v3_wfi_old = wfi_old.V2Ref, wfi_old.V3Ref
         v2_wfi_new, v3_wfi_new = bam_v2, bam_v3
 
@@ -656,12 +675,10 @@ def main():
         v2_cgi_new = np.rad2deg(np.arctan2(cgi_vec_new[1], cgi_vec_new[0])) * 3600.0
         v3_cgi_new = np.rad2deg(np.arcsin(cgi_vec_new[2])) * 3600.0
 
-        # 2. Extract Exact 3D Structural Zeta (Roll)
         try:
             r_fgs_old = R.from_quat(q_b2fgs_preflight)
             r_fgs_new = R.from_quat(q_b2fgs_calibrated)
 
-            # Ground PRD Baseline CGI Quaternion
             q_cgi_preflight = np.array(
                 [
                     0.614506283622662,
@@ -678,7 +695,6 @@ def main():
             angle_cgi_new = extract_euler_ya(r_cgi_predicted.as_quat())
             angle_cgi_new = (angle_cgi_new + 180.0) % 360.0 - 180.0
         except NameError:
-            # Fallback if FGS calibration failed upstream
             angle_cgi_new = cgi_old.V3IdlYAngle + dAngle_bulk
 
         calibrated_siaf_params["CGI_CEN"] = {
@@ -690,15 +706,14 @@ def main():
             f"Updated CGI_CEN -> V2Ref: {v2_cgi_new:.3f}, V3Ref: {v3_cgi_new:.3f}, Angle: {angle_cgi_new:.5f}"
         )
 
-        # --- EXPORT CGI BAM ---
         q_b2cgi = calculate_cgi_to_body_quaternion(
             v2_cgi_new, v3_cgi_new, angle_cgi_new
         )
         cgi_bam_file = export_acs_bam_file("CGI", q_b2cgi, obs_date_str, obs_end_str)
         print(f"Exported CGI BAM file: {cgi_bam_file}")
 
-    elif not CALIBRATE_CGI:
-        print("\nSkipping CGI_CEN calibration (CALIBRATE_CGI = False).")
+    elif not args.calibrate_cgi:
+        print("\nSkipping CGI_CEN calibration (--calibrate-cgi not provided).")
         calibrated_siaf_params.pop("CGI_CEN", None)
 
     print("\n========================================================")
@@ -714,6 +729,7 @@ def main():
         roman_siaf=roman_siaf,
         attitude_results=attitude_results,
         output_prefix="calibrated_roman_siaf",
+        fit_degree=args.fit_degree,
     )
 
     print(f"\nSUCCESS: Exported BAM-aligned SIAF to: {output_yaml}")
