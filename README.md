@@ -71,7 +71,7 @@ The script accepts optional command-line arguments so you can override telemetry
 - `--apply-dva` - Enable Differential Velocity Aberration correction (enabled by default)
 - `--custom-siaf-path PATH` - Custom SIAF path to use for testing
 
-## Example Usage
+### Example Usage
 
 ```bash
 # Run with default settings
