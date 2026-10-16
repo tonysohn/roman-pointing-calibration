@@ -60,8 +60,6 @@ The script accepts optional command-line arguments so you can override telemetry
 
 ### Command-Line Arguments
 
-**Basic Options:**
-
 ### Basic Options
 - `--qbj QX QY QZ QW` - Override telemetry quaternion (e.g., ST-based SCF_AC_EST_STGE_QBJ)
 - `--calibrate-cgi` - Enable CGI calibration propagation and BAM export (disabled by default)
