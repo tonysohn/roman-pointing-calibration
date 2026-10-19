@@ -15,6 +15,7 @@ from roman_pointing.crossmatch import (
     RobustMatchConfig,
     apply_affine_transformation,
     find_detector_consensus_matches,
+    find_direct_kdtree_matches,
     project_catalog,
 )
 
@@ -41,6 +42,13 @@ def main():
         "--gwcs",
         action="store_true",
         help="Use gWCS embedded in ASDF instead of PySIAF",
+    )
+    parser.add_argument(
+        "--direct",
+        "--skip-scout",
+        dest="direct",
+        action="store_true",
+        help="Skip 2D histogram voting and match directly via cKDTree",
     )
     parser.add_argument(
         "--target_dir",
@@ -108,11 +116,17 @@ def main():
         )
         return
 
-    # 3. Execute 2D Histogram Voting and Affine Optimization (No try/except to expose tracebacks)
-    print("Executing 2D histogram voting and robust matching...")
-    p_idx, o_idx, best_affine = find_detector_consensus_matches(
-        pred_coords, obs_coords, bin_width=config.primary_bin_pix, config=config
-    )
+    # 3. Execute Matching (Direct cKDTree or 2D Histogram Voting)
+    if args.direct:
+        print("Executing direct cKDTree matching and affine optimization...")
+        p_idx, o_idx, best_affine = find_direct_kdtree_matches(
+            pred_coords, obs_coords, config=config
+        )
+    else:
+        print("Executing 2D histogram voting and robust matching...")
+        p_idx, o_idx, best_affine = find_detector_consensus_matches(
+            pred_coords, obs_coords, bin_width=config.primary_bin_pix, config=config
+        )
 
     # 4. Save Matched ECSV Catalog
     matched_x = obs_coords[o_idx][:, 0]

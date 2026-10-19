@@ -30,10 +30,18 @@ class RobustMatchConfig:
     robust_loss_scale: float = 0.3
     normalization_scale: float = 2000.0
     max_matrix_deviation: float = 0.02
+    direct_init_radius_pix: float = 60.0
 
 
 def _compute_mutual_neighbors(predicted_coords, observed_coords, radius_limit):
     """Isolates mutual nearest-neighbor pairs within a specified pixel threshold."""
+    if len(predicted_coords) == 0 or len(observed_coords) == 0:
+        return (
+            np.array([], dtype=int),
+            np.array([], dtype=int),
+            np.array([], dtype=float),
+        )
+
     tree_obs = cKDTree(observed_coords)
     tree_pred = cKDTree(predicted_coords)
 
@@ -81,6 +89,108 @@ def apply_affine_transformation(
     return xy_points + transform_design @ affine_coeffs
 
 
+def find_direct_kdtree_matches(
+    pred_coords,
+    obs_coords,
+    seed=None,
+    shape=(4088, 4088),
+    config=RobustMatchConfig(),
+):
+    """
+    Bypasses 2D histogram voting and matches directly via cKDTree mutual nearest
+    neighbors and iterative affine refinement. Uses a two-stage bright-star capture
+    followed by full-catalog refinement to prevent crowding confusion in dense fields.
+    """
+    detector_center = np.array([(shape[1] + 1) / 2, (shape[0] + 1) / 2])
+    size = np.array(shape[::-1])
+
+    co = np.zeros((3, 2))
+    if seed is not None:
+        co[2] = np.asarray(seed, dtype=float)
+
+    # 1. Restrict predicted catalog to stars near the active SCA footprint (+200 pix margin)
+    expected = pred_coords + co[2]
+    chip_mask = np.all(
+        (expected >= -200.0) & (expected <= size + 200.0),
+        axis=1,
+    )
+    chip_indices = np.where(chip_mask)[0]
+    if len(chip_indices) < config.min_inliers_required:
+        raise RuntimeError(
+            f"Only {len(chip_indices)} reference stars projected onto detector footprint."
+        )
+
+    pred_chip = pred_coords[chip_indices]
+
+    # 2. Stage A: Coarse capture using brightest subsets (avoids crowding blocks at large radii)
+    #    If initial offset is 10-50 pix, we also do a quick fine-grid local histogram over +/-100 pix
+    #    on the brightest 600 stars to seed `co[2]` within ~1-2 pixels before cKDTree refinement.
+    n_bright = min(600, len(pred_chip), len(obs_coords))
+    bright_pred = pred_chip[:n_bright]
+    bright_obs = obs_coords[:n_bright]
+
+    local_pad = 150.0
+    local_bin = 2.0
+    edges_x = np.arange(
+        co[2, 0] - local_pad, co[2, 0] + local_pad + local_bin, local_bin
+    )
+    edges_y = np.arange(
+        co[2, 1] - local_pad, co[2, 1] + local_bin + local_pad, local_bin
+    )
+
+    offsets = (bright_obs[:, None, :] - bright_pred[None, :, :]).reshape(-1, 2)
+    hist, _, _ = np.histogram2d(offsets[:, 0], offsets[:, 1], bins=(edges_x, edges_y))
+    smoothed = gaussian_filter(hist, 1.0)
+    ix, iy = np.unravel_index(np.argmax(smoothed), smoothed.shape)
+    co[2] = [edges_x[ix] + local_bin / 2.0, edges_y[iy] + local_bin / 2.0]
+
+    # 3. Stage B: Iterative cKDTree mutual-neighbor refinement
+    #    Start on bright stars at wide radii, then open up to the full on-chip catalog
+    coarse_schedule = [30.0, 15.0, 8.0]
+    for lim in coarse_schedule:
+        p_sub, o_sub, _ = _compute_mutual_neighbors(
+            apply_affine_transformation(bright_pred, co, detector_center, config),
+            bright_obs,
+            lim,
+        )
+        if len(p_sub) >= config.min_inliers_required:
+            co = optimize_affine_mapping(
+                bright_pred[p_sub], bright_obs[o_sub], detector_center, config
+            )
+
+    fine_schedule = [10.0, 5.0, 3.0, config.search_radius_pix]
+    for lim in fine_schedule:
+        p_sub, o_sub, _ = _compute_mutual_neighbors(
+            apply_affine_transformation(pred_chip, co, detector_center, config),
+            obs_coords,
+            lim,
+        )
+        if len(p_sub) >= config.min_inliers_required:
+            co = optimize_affine_mapping(
+                pred_chip[p_sub], obs_coords[o_sub], detector_center, config
+            )
+
+    # Final evaluation at search_radius_pix on the full pred_coords array
+    p_idx, o_idx, _ = _compute_mutual_neighbors(
+        apply_affine_transformation(pred_coords, co, detector_center, config),
+        obs_coords,
+        config.search_radius_pix,
+    )
+
+    if (
+        len(p_idx) < config.min_total_matches
+        or np.max(np.abs(co[:2])) / config.normalization_scale
+        >= config.max_matrix_deviation
+    ):
+        raise RuntimeError(
+            f"Direct cKDTree matching found {len(p_idx)} matches at radius "
+            f"{config.search_radius_pix} pix (minimum required: {config.min_total_matches}; "
+            f"best shift dx={co[2, 0]:.1f}, dy={co[2, 1]:.1f} pix)."
+        )
+
+    return p_idx, o_idx, co
+
+
 def find_detector_consensus_matches(
     pred_coords,
     obs_coords,
@@ -94,7 +204,12 @@ def find_detector_consensus_matches(
     size = np.array(shape[::-1])
 
     if seed is None:
-        voted_cat = pred_coords[: config.top_catalog_sources]
+        pad_unseeded = config.max_translation_pix
+        on_chip_mask = np.all(
+            (pred_coords > -pad_unseeded) & (pred_coords < size + pad_unseeded),
+            axis=1,
+        )
+        voted_cat = pred_coords[on_chip_mask][: config.top_catalog_sources]
         voted_obs = obs_coords[: config.top_image_sources]
         edgesx = edgesy = np.arange(
             -config.max_translation_pix,
@@ -172,7 +287,14 @@ def find_detector_consensus_matches(
 
     valid_solutions.sort(key=lambda item: (-item[0], item[1]))
     if not valid_solutions or valid_solutions[0][0] < config.min_total_matches:
-        raise RuntimeError("Histogram voting failed to establish a secure consensus.")
+        try:
+            return find_direct_kdtree_matches(
+                pred_coords, obs_coords, seed=seed, shape=shape, config=config
+            )
+        except RuntimeError:
+            raise RuntimeError(
+                "Histogram voting failed to establish a secure consensus."
+            )
 
     best_affine = valid_solutions[0][2]
     p_idx, o_idx, _ = _compute_mutual_neighbors(
@@ -194,15 +316,6 @@ def project_catalog(
     use_gwcs=False,
 ):
     """Projects Gaia sources using either ASDF gWCS natively, or PySIAF with XML/YAML overrides."""
-    import os
-    import warnings
-
-    import asdf
-    import astropy.units as u
-    import numpy as np
-    from astropy.coordinates import SkyCoord
-    from astropy.time import Time
-
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         with asdf.open(asdf_filepath, lazy_load=True) as f:
@@ -241,9 +354,10 @@ def project_catalog(
         if wcs_obj is None:
             raise ValueError(f"CRITICAL: No gWCS object found inside {asdf_filepath}")
 
-        # print(f"  [INFO] Projecting {det} natively using ASDF embedded gWCS.")
-        # Fix: astropy high-level API expects a single SkyCoord object for the celestial frame
-        pixel_x, pixel_y = wcs_obj.world_to_pixel(propagated_sky)
+        # Convert 0-based gWCS output to 1-based pixels to match SIAF and obs_pixels (+1)
+        px0, py0 = wcs_obj.world_to_pixel(propagated_sky)
+        pixel_x = px0 + 1.0
+        pixel_y = py0 + 1.0
 
     else:
         import pysiaf

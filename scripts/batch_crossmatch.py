@@ -17,6 +17,7 @@ from roman_pointing.crossmatch import (
     RobustMatchConfig,
     apply_affine_transformation,
     find_detector_consensus_matches,
+    find_direct_kdtree_matches,
     project_catalog,
 )
 
@@ -31,6 +32,7 @@ def process_single_detector(
     dV2=0.0,
     dV3=0.0,
     use_gwcs=False,
+    direct_mode=False,
 ):
     """Isolated worker function executing a seeded fine-match on a dedicated CPU core."""
     basename = os.path.basename(asdf_path)
@@ -73,13 +75,21 @@ def process_single_detector(
 
         seeded_config = dataclasses.replace(config, window_padding_pix=400.0)
 
-        cat_idxs, obs_idxs, best_affine = find_detector_consensus_matches(
-            pred_pixels,
-            obs_pixels,
-            seeded_config.primary_bin_pix,
-            seed=global_seed,
-            config=seeded_config,
-        )
+        if direct_mode:
+            cat_idxs, obs_idxs, best_affine = find_direct_kdtree_matches(
+                pred_pixels,
+                obs_pixels,
+                seed=global_seed,
+                config=seeded_config,
+            )
+        else:
+            cat_idxs, obs_idxs, best_affine = find_detector_consensus_matches(
+                pred_pixels,
+                obs_pixels,
+                seeded_config.primary_bin_pix,
+                seed=global_seed,
+                config=seeded_config,
+            )
 
         matched_x = obs_pixels[obs_idxs, 0]
         matched_y = obs_pixels[obs_idxs, 1]
@@ -160,6 +170,13 @@ def main():
         action="store_true",
         help="Use gWCS embedded in ASDF instead of PySIAF",
     )
+    parser.add_argument(
+        "--direct",
+        "--skip-scout",
+        dest="direct",
+        action="store_true",
+        help="Skip scout/histogram voting and go directly to cKDTree matching (for guided images / good WCS)",
+    )
     args = parser.parse_args()
 
     print("--- Robust SIAF Cross-Match Pipeline (Parallelized) ---")
@@ -191,73 +208,83 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     config = RobustMatchConfig()
 
-    scout_file = next((f for f in asdf_files if "WFI01" in f.upper()), asdf_files[0])
-    scout_name = os.path.basename(scout_file)
-    print(
-        f"\nExecuting native scout match on {scout_name} to lock global attitude offset..."
-    )
+    if args.direct:
+        print(
+            "\nDIRECT cKDTree MODE ENABLED: Skipping scout & 2D histogram voting (assuming near-zero pointing offset)."
+        )
+        global_seed = np.array([0.0, 0.0])
+        passed_dV2 = 0.0
+        passed_dV3 = 0.0
+    else:
+        scout_file = next(
+            (f for f in asdf_files if "WFI01" in f.upper()), asdf_files[0]
+        )
+        scout_name = os.path.basename(scout_file)
+        print(
+            f"\nExecuting native scout match on {scout_name} to lock global attitude offset..."
+        )
 
-    scout_cat_path = f"{scout_name.replace('_cal.asdf', '')}_cal.asdf_catalog.ecsv"
-    scout_obs = Table.read(scout_cat_path, format="ascii.ecsv")
-    if "flux" in scout_obs.colnames:
-        scout_obs.sort("flux", reverse=True)
+        scout_cat_path = f"{scout_name.replace('_cal.asdf', '')}_cal.asdf_catalog.ecsv"
+        scout_obs = Table.read(scout_cat_path, format="ascii.ecsv")
+        if "flux" in scout_obs.colnames:
+            scout_obs.sort("flux", reverse=True)
 
-    if len(scout_obs) > 10000:
-        scout_obs = scout_obs[:10000]
+        if len(scout_obs) > 10000:
+            scout_obs = scout_obs[:10000]
 
-    scout_pixels = np.column_stack(
-        [
-            scout_obs["x"] + 1
-            if "x" in scout_obs.colnames
-            else scout_obs["x_centroid"] + 1,
-            scout_obs["y"] + 1
-            if "y" in scout_obs.colnames
-            else scout_obs["y_centroid"] + 1,
-        ]
-    )
+        scout_pixels = np.column_stack(
+            [
+                scout_obs["x"] + 1
+                if "x" in scout_obs.colnames
+                else scout_obs["x_centroid"] + 1,
+                scout_obs["y"] + 1
+                if "y" in scout_obs.colnames
+                else scout_obs["y_centroid"] + 1,
+            ]
+        )
 
-    _, scout_pred_pixels = project_catalog(
-        scout_file,
-        ref_catalog,
-        config,
-        custom_siaf_filepath=args.siaf,
-        dV2=0.0,
-        dV3=0.0,
-        use_gwcs=args.gwcs,
-    )
+        _, scout_pred_pixels = project_catalog(
+            scout_file,
+            ref_catalog,
+            config,
+            custom_siaf_filepath=args.siaf,
+            dV2=0.0,
+            dV3=0.0,
+            use_gwcs=args.gwcs,
+        )
 
-    _, _, scout_affine = find_detector_consensus_matches(
-        scout_pred_pixels,
-        scout_pixels,
-        config.primary_bin_pix,
-        seed=None,
-        config=config,
-    )
+        _, _, scout_affine = find_detector_consensus_matches(
+            scout_pred_pixels,
+            scout_pixels,
+            config.primary_bin_pix,
+            seed=None,
+            config=config,
+        )
 
-    dx_pix, dy_pix = scout_affine[2]
-    print(f"Scout pixel shift locked: dx={dx_pix:.1f}, dy={dy_pix:.1f} pixels.")
+        dx_pix, dy_pix = scout_affine[2]
+        print(f"Scout pixel shift locked: dx={dx_pix:.1f}, dy={dy_pix:.1f} pixels.")
 
-    import pysiaf
+        import pysiaf
 
-    rsiaf = pysiaf.Siaf("Roman")
-    scout_aper = rsiaf["WFI01_FULL"]
-    v2_cen, v3_cen = scout_aper.sci_to_tel(2044.5, 2044.5)
-    v2_shift, v3_shift = scout_aper.sci_to_tel(2044.5 + dx_pix, 2044.5 + dy_pix)
+        rsiaf = pysiaf.Siaf("Roman")
+        scout_aper = rsiaf["WFI01_FULL"]
+        v2_cen, v3_cen = scout_aper.sci_to_tel(2044.5, 2044.5)
+        v2_shift, v3_shift = scout_aper.sci_to_tel(2044.5 + dx_pix, 2044.5 + dy_pix)
 
-    dV2 = v2_shift - v2_cen
-    dV3 = v3_shift - v3_cen
-    print(f"Global V2/V3 correction locked: dV2={dV2:.3f}, dV3={dV3:.3f} arcsec.")
+        dV2 = v2_shift - v2_cen
+        dV3 = v3_shift - v3_cen
+        print(f"Global V2/V3 correction locked: dV2={dV2:.3f}, dV3={dV3:.3f} arcsec.")
 
-    # Apply the native pixel shift as a global search offset for all worker chips
-    global_seed = (
-        np.array([dx_pix, dy_pix])
-        if args.gwcs
-        else (np.array([0.0, 0.0]) if args.siaf else np.array([dx_pix, dy_pix]))
-    )
+        # Apply the native pixel shift as a global search offset for all worker chips
+        global_seed = (
+            np.array([dx_pix, dy_pix])
+            if args.gwcs
+            else (np.array([0.0, 0.0]) if args.siaf else np.array([dx_pix, dy_pix]))
+        )
 
-    # We zero out dV2/dV3 for gWCS since it natively solves via detector pixel offsets
-    passed_dV2 = 0.0 if args.gwcs else (dV2 if args.siaf else 0.0)
-    passed_dV3 = 0.0 if args.gwcs else (dV3 if args.siaf else 0.0)
+        # We zero out dV2/dV3 for gWCS since it natively solves via detector pixel offsets
+        passed_dV2 = 0.0 if args.gwcs else (dV2 if args.siaf else 0.0)
+        passed_dV3 = 0.0 if args.gwcs else (dV3 if args.siaf else 0.0)
 
     print(f"\nDispatching {len(asdf_files)} SCAs to worker pool (4 at a time)")
     print(f"============================================================")
@@ -279,6 +306,7 @@ def main():
                 passed_dV2,
                 passed_dV3,
                 args.gwcs,
+                args.direct,
             ): asdf_path
             for asdf_path in asdf_files
         }
