@@ -1,3 +1,4 @@
+import copy
 import glob
 import json
 import os
@@ -444,6 +445,18 @@ def align_wfi(
     if roman_siaf is None:
         roman_siaf = pysiaf.Siaf("Roman")
 
+    # --- CRITICAL FIX: Preserve original baseline coordinates before in-place mutation ---
+    orig_siaf_coords = {
+        aper_name: (
+            roman_siaf[aper_name].V2Ref,
+            roman_siaf[aper_name].V3Ref,
+            roman_siaf[aper_name].V3IdlYAngle,
+        )
+        for aper_name in phot_catalogs.keys()
+        if aper_name in roman_siaf.apertures
+    }
+    pristine_siaf_copy = copy.deepcopy(roman_siaf)
+
     cos_dec = np.cos(np.deg2rad(pointing_info["DEC_V1"]))
 
     current_ra = pointing_info["RA_V1"]
@@ -708,7 +721,6 @@ def align_wfi(
             mapping = {}
             idx = 0
 
-            # --- CRITICAL FIX RESTORED: Map natively to PySIAF's "{TotalDegree}{Y_Degree}" format ---
             for d in range(fit_degree + 1):
                 for y_deg in range(d + 1):
                     mapping[idx] = f"{d}{y_deg}"
@@ -767,21 +779,22 @@ def align_wfi(
     }
 
     if len(successfully_fitted_scas) > 0:
+        # --- CRITICAL FIX: Use orig_siaf_coords to calculate true residual means ---
         mean_dv2 = np.mean(
             [
-                calibrated_siaf_params[s]["V2Ref"] - roman_siaf[s].V2Ref
+                calibrated_siaf_params[s]["V2Ref"] - orig_siaf_coords[s][0]
                 for s in successfully_fitted_scas
             ]
         )
         mean_dv3 = np.mean(
             [
-                calibrated_siaf_params[s]["V3Ref"] - roman_siaf[s].V3Ref
+                calibrated_siaf_params[s]["V3Ref"] - orig_siaf_coords[s][1]
                 for s in successfully_fitted_scas
             ]
         )
         mean_dtheta = np.mean(
             [
-                calibrated_siaf_params[s]["V3IdlYAngle"] - roman_siaf[s].V3IdlYAngle
+                calibrated_siaf_params[s]["V3IdlYAngle"] - orig_siaf_coords[s][2]
                 for s in successfully_fitted_scas
             ]
         )
@@ -857,12 +870,13 @@ def align_wfi(
             new_row[8] = round(float(final_v3[i]), 4)
             diagnostic_log.append(new_row)
 
+    # --- CRITICAL FIX: Pass pristine unmutated SIAF copy for diagnostics ---
     generate_alignment_diagnostics(
         matched_pairs_log=diagnostic_log,
         iteration_history=iteration_history,
         output_dir="./diagnostics",
         calibrated_siaf_params=calibrated_siaf_params,
-        nominal_siaf=roman_siaf,
+        nominal_siaf=pristine_siaf_copy,
     )
 
     prd_siaf = pysiaf.Siaf("Roman")
@@ -880,24 +894,19 @@ def align_wfi(
             calibrated_siaf_params["WFI_CEN"]["V3IdlYAngle"] - wfi_old.V3IdlYAngle
         )
 
-        # 1. Create the Body -> Sky attitude matrices for the old and new alignments
         M_old = pysiaf.utils.rotations.attitude(v2_wfi_old, v3_wfi_old, 0.0, 0.0, 0.0)
         M_new = pysiaf.utils.rotations.attitude(
             v2_wfi_new, v3_wfi_new, 0.0, 0.0, dtheta_deg
         )
 
-        # 2. Extract the pure 3D rigid body rotation delta (Body_new -> Body_old)
         delta_R_matrix = np.dot(M_new.T, M_old)
 
-        # 3. Propagate the V2/V3 boresight physically in 3D
         cgi_vec_old_body = get_3d_vector(cgi_old.V2Ref, cgi_old.V3Ref)
         cgi_vec_new_body = np.dot(delta_R_matrix, cgi_vec_old_body)
         v2_cgi_new, v3_cgi_new = get_v2v3_from_3d(cgi_vec_new_body)
 
-        # 4. Propagate the Zeta Angle rigorously using the flight software Euler sequence
         from scipy.spatial.transform import Rotation as R
 
-        # Reconstruct the pre-flight BAM quaternion using the old parameters
         ya_rad = np.deg2rad(cgi_old.V3IdlYAngle)
         bz_rad = np.deg2rad(cgi_old.V3Ref / 3600.0)
         by_rad = np.deg2rad(cgi_old.V2Ref / 3600.0)
@@ -925,15 +934,12 @@ def align_wfi(
         )
         m_x2z = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
 
-        # Pre-flight CGI BAM
         m_cgi2obs_old = (m_x2z @ r1 @ r2 @ r3).T
         r_cgi_pre = R.from_matrix(m_cgi2obs_old)
 
-        # Apply the bulk 3D rotation to the quaternion
         r_delta = R.from_matrix(delta_R_matrix)
         r_cgi_predicted = r_delta * r_cgi_pre
 
-        # Extract the exact Euler 'ya' angle
         a = m_x2z.T @ r_cgi_predicted.inv().as_matrix()
         angle_cgi_new = np.rad2deg(np.arctan2(-a[1, 2], a[2, 2]))
 
@@ -956,7 +962,6 @@ def export_alignment_to_yaml(
     mapping = {}
     idx = 0
 
-    # --- CRITICAL FIX RESTORED: Map natively to PySIAF's "{TotalDegree}{Y_Degree}" format ---
     for d in range(fit_degree + 1):
         for y_deg in range(d + 1):
             mapping[idx] = f"{d}{y_deg}"

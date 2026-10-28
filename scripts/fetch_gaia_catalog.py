@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Roman WFI_CEN Gaia DR3 query: MAST or the attached FORTRAN's local dBJ format.
 Local decoding follows query_GAIA_DR3.F; selection uses a spherical cone.
 No epoch propagation is performed. Local packed values are not lossless originals.
